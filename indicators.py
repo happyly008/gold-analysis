@@ -203,6 +203,117 @@ def calc_atr(candles: List[Dict], period: int = 14) -> float:
     return atr
 
 
+def calc_adx(candles: List[Dict], period: int = 14) -> Dict:
+    """
+    平均趋向指标 ADX (Average Directional Index)
+    用于判断趋势强度：
+    - ADX < 20: 无趋势/震荡
+    - 20 <= ADX < 25: 弱趋势
+    - 25 <= ADX < 50: 强趋势
+    - ADX >= 50: 极强趋势
+    
+    返回: adx, +di, -di, trend_strength
+    """
+    if len(candles) < period * 2 + 1:
+        return {'adx': 0, 'plus_di': 0, 'minus_di': 0, 'trend_strength': 'unknown'}
+    
+    # 计算 +DM, -DM, TR
+    plus_dm = []
+    minus_dm = []
+    trs = []
+    
+    for i in range(1, len(candles)):
+        h = candles[i]['high']
+        l = candles[i]['low']
+        ph = candles[i-1]['high']
+        pl = candles[i-1]['low']
+        pc = candles[i-1]['close']
+        
+        # True Range
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+        
+        # +DM, -DM
+        up_move = h - ph
+        down_move = pl - l
+        
+        if up_move > down_move and up_move > 0:
+            plus_dm.append(up_move)
+        else:
+            plus_dm.append(0)
+        
+        if down_move > up_move and down_move > 0:
+            minus_dm.append(down_move)
+        else:
+            minus_dm.append(0)
+    
+    if len(trs) < period:
+        return {'adx': 0, 'plus_di': 0, 'minus_di': 0, 'trend_strength': 'unknown'}
+    
+    # 平滑计算 (Wilder's smoothing)
+    atr_val = sum(trs[:period]) / period
+    plus_dm_smooth = sum(plus_dm[:period]) / period
+    minus_dm_smooth = sum(minus_dm[:period]) / period
+    
+    plus_di_list = []
+    minus_di_list = []
+    dx_list = []
+    
+    # 计算前 period 个 +DI, -DI
+    for i in range(period):
+        if atr_val > 0:
+            pdi = (plus_dm_smooth / atr_val) * 100
+            mdi = (minus_dm_smooth / atr_val) * 100
+        else:
+            pdi = 0
+            mdi = 0
+        plus_di_list.append(pdi)
+        minus_di_list.append(mdi)
+        
+        # DX = |+DI - -DI| / (+DI + -DI) * 100
+        di_sum = pdi + mdi
+        if di_sum > 0:
+            dx = abs(pdi - mdi) / di_sum * 100
+        else:
+            dx = 0
+        dx_list.append(dx)
+        
+        # 更新平滑值
+        if i + period < len(trs):
+            atr_val = (atr_val * (period - 1) + trs[i + period]) / period
+            plus_dm_smooth = (plus_dm_smooth * (period - 1) + plus_dm[i + period]) / period
+            minus_dm_smooth = (minus_dm_smooth * (period - 1) + minus_dm[i + period]) / period
+    
+    # 计算 ADX (DX 的 period 周期平均)
+    if len(dx_list) < period:
+        adx = sum(dx_list) / len(dx_list) if dx_list else 0
+    else:
+        adx = sum(dx_list[:period]) / period
+        for i in range(period, len(dx_list)):
+            adx = (adx * (period - 1) + dx_list[i]) / period
+    
+    # 当前 +DI, -DI
+    plus_di = plus_di_list[-1] if plus_di_list else 0
+    minus_di = minus_di_list[-1] if minus_di_list else 0
+    
+    # 趋势强度判断
+    if adx < 20:
+        trend_strength = 'no_trend'
+    elif adx < 25:
+        trend_strength = 'weak'
+    elif adx < 50:
+        trend_strength = 'strong'
+    else:
+        trend_strength = 'very_strong'
+    
+    return {
+        'adx': round(adx, 2),
+        'plus_di': round(plus_di, 2),
+        'minus_di': round(minus_di, 2),
+        'trend_strength': trend_strength,
+    }
+
+
 def calc_kdj(candles: List[Dict], n: int = 9, m1: int = 3, m2: int = 3) -> Dict:
     """
     KDJ 随机指标
@@ -451,6 +562,7 @@ def calc_all_indicators(candles: List[Dict]) -> Dict:
     rsi14 = calc_rsi(closes, 14)
     boll = calc_bollinger(closes)
     atr = calc_atr(candles)
+    adx = calc_adx(candles)
     kdj = calc_kdj(candles)
     sr = find_support_resistance(candles)
     
@@ -503,6 +615,7 @@ def calc_all_indicators(candles: List[Dict]) -> Dict:
             'width': round(boll['width'], 2),
         },
         'atr': round(atr, 2),
+        'adx': adx,
         'support_resistance': sr,
         'volume_price': analyze_volume_price(candles),
         'dow_trend': analyze_dow_trend(candles),

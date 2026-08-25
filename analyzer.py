@@ -195,6 +195,34 @@ def analyze_single_timeframe(candles: List[Dict], label: str) -> Dict:
             score -= 0.3
             reasons.append('道氏中期趋势确认')
     
+    # 10. ADX趋势强度过滤 (±0.5分 + 信号置信度调节)
+    adx = indicators.get('adx', {})
+    if adx:
+        adx_val = adx.get('adx', 0)
+        trend_strength = adx.get('trend_strength', 'unknown')
+        plus_di = adx.get('plus_di', 0)
+        minus_di = adx.get('minus_di', 0)
+        
+        if trend_strength == 'no_trend' or adx_val < 20:
+            # 无趋势/震荡市：趋势信号打折，均值回归信号加分
+            score *= 0.8
+            reasons.append(f'ADX={adx_val:.0f}无趋势，信号衰减20%')
+            # 震荡市中 RSI 超买超卖更有意义
+            if rsi >= 65:
+                score -= 0.3
+                reasons.append('震荡市RSI偏高，回归预期')
+            elif rsi <= 35:
+                score += 0.3
+                reasons.append('震荡市RSI偏低，反弹预期')
+        elif trend_strength in ('strong', 'very_strong') and adx_val >= 25:
+            # 强趋势市：趋势方向上的信号加分
+            if plus_di > minus_di:
+                score += 0.5
+                reasons.append(f'ADX={adx_val:.0f}强趋势(+DI>{minus_di:.0f})，趋势可信')
+            else:
+                score -= 0.5
+                reasons.append(f'ADX={adx_val:.0f}强趋势(-DI>{plus_di:.0f})，趋势可信')
+    
     # 趋势判断
     if score >= 2.5:
         trend = '强势上涨'
@@ -320,6 +348,33 @@ def analyze_multi_timeframe_v2(klines: Dict) -> Dict:
             overall = overall.replace('看空', '偏空').replace('强烈看空', '看空')
     
     # 综合得分（加权）
+    # 波动率自适应权重：根据市场波动率动态调整各层权重
+    # 高波动时趋势层权重增加（更看重长周期信号），低波动时日内层权重增加
+    
+    # 计算整体波动率（使用日线ATR/价格作为波动率指标）
+    daily_volatility = 0
+    for tf in all_results:
+        if tf.get('label') == '日线':
+            atr = tf.get('indicators', {}).get('atr', 0)
+            current_price = tf.get('indicators', {}).get('current', 0)
+            if current_price > 0:
+                daily_volatility = atr / current_price * 100  # 百分比
+            break
+    
+    # 根据波动率调整权重
+    if daily_volatility > 2.0:  # 高波动
+        layers['trend']['weight'] = 0.5  # 趋势层权重增加
+        layers['swing']['weight'] = 0.35
+        layers['intraday']['weight'] = 0.15  # 日内层权重减少
+        vol_regime = 'high'
+    elif daily_volatility < 0.8:  # 低波动
+        layers['trend']['weight'] = 0.3
+        layers['swing']['weight'] = 0.35
+        layers['intraday']['weight'] = 0.35  # 日内层权重增加
+        vol_regime = 'low'
+    else:  # 正常波动
+        vol_regime = 'normal'
+    
     combined_score = sum(layer_scores[k] * layers[k]['weight'] for k in layers.keys())
     
     # 置信度
