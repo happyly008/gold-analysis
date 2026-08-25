@@ -1,68 +1,59 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-基本面分析模块 v2.0
-优化点：
-- 实际利率：用分位+边际变化，而非固定阈值
-- 美元指数：用分位+斜率，横盘也看位置
-- 通胀：用预期差，而非绝对同比
-- 数据新鲜度衰减
+基本面分析模块 v2.1
+改进:
+- analyze_employment_v2(): 数据新鲜度衰减天数从"写死7天"
+  改为"从 NFP 实际发布日期计算", 更准确反映数据时效
+- analyze_real_rate_v2() 等: 当 FRED 历史数据为空时,
+  优先使用 macro_data 中的 *_range fallback (由 data_fetcher 提供)
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 from datetime import datetime, timedelta
+import math
 import logging
 
 logger = logging.getLogger(__name__)
 
 
-def calculate_percentile(value: float, historical_data: List[float] = None, historical_range: tuple = None) -> float:
-    """
-    计算历史分位数
-    
-    Args:
-        value: 当前值
-        historical_data: 历史数据列表（优先使用）
-        historical_range: 历史范围(min, max)（备用）
-    
-    Returns:
-        0-100 分位数
-    """
-    # 优先使用真实历史数据
+def calculate_percentile(value: float, historical_data: List[float] = None,
+                         historical_range: tuple = None) -> Optional[float]:
+    """计算历史分位数 (0-100)"""
     if historical_data and len(historical_data) > 0:
-        # 过滤异常值
-        valid_data = [v for v in historical_data if v is not None and not (v != v)]  # 过滤NaN
+        valid_data = [v for v in historical_data if v is not None and not (isinstance(v, float) and math.isnan(v))]
         if len(valid_data) > 0:
-            # 计算当前值在历史数据中的位置
             count_below = sum(1 for v in valid_data if v < value)
             percentile = (count_below / len(valid_data)) * 100
-            return max(0, min(100, percentile))
-    
-    # 备用：使用硬编码范围
+            return max(0.0, min(100.0, percentile))
     if historical_range:
         min_val, max_val = historical_range
         if max_val == min_val:
             return 50.0
         percentile = (value - min_val) / (max_val - min_val) * 100
-        return max(0, min(100, percentile))
-    
-    # 都没有数据
+        return max(0.0, min(100.0, percentile))
     return None
 
 
 def apply_freshness_decay(score: float, days_since_release: int) -> float:
-    """
-    应用数据新鲜度衰减
-    - 7天内: 1.0权重
-    - 8-30天: 0.8权重
-    - 超过30天: 0.5权重
-    """
+    """数据新鲜度衰减: 7天内1.0, 8-30天0.8, 超过30天0.5"""
     if days_since_release <= 7:
         return score * 1.0
     elif days_since_release <= 30:
         return score * 0.8
     else:
         return score * 0.5
+
+
+def _days_since(date_str: str) -> int:
+    """从 'YYYY-MM-DD' 字符串计算距今天数, 失败返回 7"""
+    if not date_str:
+        return 7
+    try:
+        d = datetime.strptime(date_str, '%Y-%m-%d')
+        return max(0, (datetime.now() - d).days)
+    except Exception:
+        return 7
 
 
 def analyze_real_rate_v2(real_rate: float, macro_data: Dict) -> Dict:
@@ -75,9 +66,10 @@ def analyze_real_rate_v2(real_rate: float, macro_data: Dict) -> Dict:
     score = 0.0
     reasons = []
     
-    # 历史分位（优先使用真实历史数据）
+    # 历史分位（优先使用真实历史数据，失败时用*_range fallback）
     historical_data = macro_data.get('real_rate_history', [])
-    percentile = calculate_percentile(real_rate, historical_data, (-1.5, 2.5))
+    historical_range = macro_data.get('real_rate_range', (-1.5, 2.5))
+    percentile = calculate_percentile(real_rate, historical_data, historical_range)
     
     if percentile is None:
         percentile = 50.0  # 默认中性
@@ -283,10 +275,12 @@ def analyze_employment_v2(macro_data: Dict) -> Dict:
         score -= 0.3
         reasons.append(f"失业率{unemployment:.1f}%，就业充分")
     
-    # 数据新鲜度衰减（假设NFP每月第一个周五发布）
-    # 这里简化处理，实际应该从macro_data获取发布日期
-    days_since_release = 7  # 假设7天内
+    # 数据新鲜度衰减：从 NFP 实际发布日期计算
+    nfp_date = macro_data.get('nonfarm_date', '')
+    days_since_release = _days_since(nfp_date)
     score = apply_freshness_decay(score, days_since_release)
+    if days_since_release > 14:
+        reasons.append(f"NFP数据已{days_since_release}天未更新，评分衰减")
     
     outlook = 'bullish' if score > 0.3 else ('bearish' if score < -0.3 else 'neutral')
     
@@ -337,9 +331,10 @@ def analyze_vix_v2(vix: float, macro_data: Dict = None) -> Dict:
     score = 0.0
     reasons = []
     
-    # 历史分位（优先使用真实历史数据）
+    # 历史分位（优先使用真实历史数据，失败时用*_range fallback）
     historical_data = macro_data.get('vix_history', []) if macro_data else []
-    percentile = calculate_percentile(vix, historical_data, (10, 40))
+    historical_range = macro_data.get('vix_range', (10, 40)) if macro_data else (10, 40)
+    percentile = calculate_percentile(vix, historical_data, historical_range)
     
     if percentile is None:
         percentile = 50.0

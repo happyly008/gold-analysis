@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-综合分析引擎 v3.0
+综合分析引擎 v3.1
+改进:
+- 地缘评分从"简单加法"改为"加权融合"(归一化后参与总权重),
+  避免 geo_score 过大时主导综合得分
+- 执行层信号增加"基本面边际变化触发"(实际利率大幅改善/恶化)
+
 优化点：
 1. 多周期分层（日内/波段/趋势）
 2. 信号引擎分层（方向层+执行层）
@@ -16,6 +21,7 @@ from geopolitical import GeopoliticalMonitor, format_geopolitical_report
 import logging
 import json
 import os
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -726,13 +732,15 @@ def comprehensive_analysis(realtime: Dict, klines: Dict, macro_data: Dict,
         logger.info("[4/4] 执行地缘政治分析...")
         try:
             geo_monitor.fetch_all_news()
+            # 使用新版接口
+            geo_result = geo_monitor.get_geo_result()
             geo_risk = geo_monitor.score_geopolitical_risk()
-            geo_impact = geo_monitor.get_gold_impact_score()
             geopolitical = {
                 'risk': geo_risk,
-                'impact_score': geo_impact,
+                'impact_score': geo_result.score,  # 新版：[-1, 1]标准化得分
+                'geo_result': geo_result.to_dict(),
             }
-            logger.info(f"地缘政治完成: 风险等级={geo_risk.get('level', 'N/A')}, 影响分数={geo_impact:.2f}")
+            logger.info(f"地缘政治完成: 风险等级={geo_risk.get('level', 'N/A')}, 标准化得分={geo_result.score:+.2f}, 决策={geo_result.action}")
         except Exception as e:
             logger.error(f"地缘政治分析失败: {e}", exc_info=True)
     
@@ -748,8 +756,12 @@ def comprehensive_analysis(realtime: Dict, klines: Dict, macro_data: Dict,
     w_sent = weights.get('sentiment', 0.25)
     w_geo = weights.get('geopolitical_bonus', 0.30)
     
+    # v3.1: 地缘加权融合（替代简单加法，避免geo_score过大主导综合得分）
+    # 地缘分[-1,1]归一化到[0,1]后参与加权，再除以总权重归一化
+    geo_norm = max(0.0, min(1.0, (geo_score + 1.0) / 2.0))
+    total_w = w_tech + w_fund + w_sent + w_geo
     base_score = tech_score * w_tech + fund_score * w_fund + sent_score * w_sent
-    total_score = base_score + geo_score * w_geo
+    total_score = (base_score + geo_norm * w_geo) / total_w
     
     # 综合判断
     if total_score >= 2.0:

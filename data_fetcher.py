@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-数据获取模块 v2.0
-三套体系数据源：
-- 实时行情: 新浪 (伦敦金/美元/原油/白银)
-- 宏观数据: FRED (利率/通胀/VIX) + 新浪 (美元指数)
-- 资金数据: CFTC持仓 + SSGA(GLD ETF)
+数据获取模块 v2.1
+改进:
+- get_cftc_gold_positions(): 增加净头寸合理性校验
+  (COMEX 黄金非商业净多头正常在万手级, |net|<1000 视为异常并跳过)
+- get_macro_data(): FRED 历史数据拉取失败时提供默认范围 fallback,
+  避免 fundamental_analyzer 分位计算返回 None -> 报告显示 N/A
 """
 
 import requests
@@ -20,6 +21,13 @@ logger = logging.getLogger(__name__)
 HEADERS = {
     'Referer': 'https://finance.sina.com.cn/',
     'User-Agent': 'Mozilla/5.0 GoldAnalyzer/2.0'
+}
+
+# FRED历史数据默认范围（当实际数据拉取失败时使用）
+FRED_DEFAULT_RANGES = {
+    'DFII10': (-2.0, 3.0),    # 实际利率范围
+    'DGS10': (0.5, 5.0),      # 10年期国债收益率
+    'VIXCLS': (10, 40),       # VIX恐慌指数
 }
 
 # ============================================================
@@ -275,7 +283,15 @@ def get_macro_data() -> Dict:
         if data:
             result['us10y'] = data[-1]
             # 获取历史数据用于分位数计算
-            result['us10y_history'] = fred_historical_data('DGS10', years=5)
+            history = fred_historical_data('DGS10', years=5)
+            if not history:
+                # v2.1: FRED历史数据失败时使用默认范围fallback
+                default_range = FRED_DEFAULT_RANGES.get('DGS10')
+                if default_range:
+                    result['us10y_range'] = default_range
+                    logger.info(f"10Y国债历史数据为空，使用默认范围: {default_range}")
+            else:
+                result['us10y_history'] = history
             logger.debug(f"10Y国债: {data[-1]['value']:.2f}%")
     except Exception as e:
         logger.warning(f"获取10Y国债失败: {e}")
@@ -286,7 +302,14 @@ def get_macro_data() -> Dict:
         if data:
             result['real_rate'] = data[-1]
             # 获取历史数据用于分位数计算
-            result['real_rate_history'] = fred_historical_data('DFII10', years=5)
+            history = fred_historical_data('DFII10', years=5)
+            if not history:
+                default_range = FRED_DEFAULT_RANGES.get('DFII10')
+                if default_range:
+                    result['real_rate_range'] = default_range
+                    logger.info(f"实际利率历史数据为空，使用默认范围: {default_range}")
+            else:
+                result['real_rate_history'] = history
             logger.debug(f"实际利率: {data[-1]['value']:.2f}%")
     except Exception as e:
         logger.warning(f"获取实际利率失败: {e}")
@@ -306,7 +329,14 @@ def get_macro_data() -> Dict:
         if data:
             result['vix'] = data[-1]
             # 获取历史数据用于分位数计算
-            result['vix_history'] = fred_historical_data('VIXCLS', years=5)
+            history = fred_historical_data('VIXCLS', years=5)
+            if not history:
+                default_range = FRED_DEFAULT_RANGES.get('VIXCLS')
+                if default_range:
+                    result['vix_range'] = default_range
+                    logger.info(f"VIX历史数据为空，使用默认范围: {default_range}")
+            else:
+                result['vix_history'] = history
             logger.debug(f"VIX: {data[-1]['value']:.2f}")
     except Exception as e:
         logger.warning(f"获取VIX失败: {e}")
@@ -451,6 +481,13 @@ def get_cftc_gold_positions() -> Dict:
                     
                     # 计算衍生指标
                     net_position = noncommercial_long - noncommercial_short
+                    
+                    # v2.1新增：净头寸合理性校验
+                    # COMEX黄金非商业净多头正常在万手级(5万-30万)，|net|<1000视为异常
+                    if abs(net_position) < 1000:
+                        logger.error(f"CFTC净头寸异常: {net_position}，跳过本行数据")
+                        continue
+                    
                     long_short_ratio = noncommercial_long / noncommercial_short if noncommercial_short > 0 else 0
                     total_open_interest = total_long + total_short
                     net_position_pct = (net_position / total_open_interest * 100) if total_open_interest > 0 else 0
