@@ -58,11 +58,50 @@ def send_email(config: configparser.ConfigParser, subject: str, body: str, html:
         return False
 
 
-def send_analysis_report(config: configparser.ConfigParser, report: str) -> bool:
-    """发送分析报告"""
+def send_analysis_report(config: configparser.ConfigParser, report: str, html_report: str = None) -> bool:
+    """发送分析报告（支持纯文本和HTML格式）"""
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
     subject = f"📊 黄金分析报告 - {now}"
-    return send_email(config, subject, report)
+    
+    # 如果提供了HTML报告，使用multipart/alternative格式
+    if html_report:
+        try:
+            smtp_server = config.get('smtp', 'server')
+            smtp_port = config.getint('smtp', 'port')
+            smtp_user = config.get('smtp', 'user')
+            smtp_pass = config.get('smtp', 'password')
+            use_ssl = config.getboolean('smtp', 'ssl', fallback=True)
+            recipients = [r.strip() for r in config.get('smtp', 'recipients').split(',')]
+            
+            msg = MIMEMultipart('alternative')
+            msg['From'] = smtp_user
+            msg['To'] = ', '.join(recipients)
+            msg['Subject'] = subject
+            
+            # 添加纯文本版本（fallback）
+            msg.attach(MIMEText(report, 'plain', 'utf-8'))
+            # 添加HTML版本（优先显示）
+            msg.attach(MIMEText(html_report, 'html', 'utf-8'))
+            
+            if use_ssl:
+                server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
+            else:
+                server = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
+                server.starttls()
+            
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+            server.quit()
+            
+            logger.info(f"HTML邮件已发送: {subject}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"邮件发送失败: {e}")
+            return False
+    else:
+        # 没有HTML报告，发送纯文本
+        return send_email(config, subject, report)
 
 
 def send_price_alert(config: configparser.ConfigParser, alert_msg: str, price: float, condition: str) -> bool:

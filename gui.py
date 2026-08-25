@@ -14,6 +14,7 @@ from datetime import datetime
 import sys
 import os
 import webbrowser
+import matplotlib.font_manager as fm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -49,8 +50,22 @@ class GoldAnalysisGUI:
         self.latest_html_path = None
         self.latest_analysis = None
 
+        # 检测中文字体
+        self.chinese_font = self._detect_chinese_font()
+        logger.info(f"检测到中文字体: {self.chinese_font}")
+
         self.setup_ui()
         self.load_config()
+
+    def _detect_chinese_font(self) -> str:
+        """检测系统中可用的中文字体"""
+        chinese_fonts = ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 
+                         'Noto Sans CJK SC', 'Source Han Sans SC', 'AR PL UMing CN']
+        available = {f.name for f in fm.fontManager.ttflist}
+        for font in chinese_fonts:
+            if font in available:
+                return font
+        return 'DejaVu Sans'  # fallback
 
     def setup_ui(self):
         # \u9876\u90e8\u63a7\u5236\u680f

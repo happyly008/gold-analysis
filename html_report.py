@@ -19,8 +19,23 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# 动态检测中文字体
+def _detect_chinese_font() -> str:
+    """检测系统中可用的中文字体"""
+    chinese_fonts = ['SimHei', 'Microsoft YaHei', 'WenQuanYi Micro Hei', 
+                     'Noto Sans CJK SC', 'Source Han Sans SC', 'AR PL UMing CN']
+    try:
+        import matplotlib.font_manager as fm
+        available = {f.name for f in fm.fontManager.ttflist}
+        for font in chinese_fonts:
+            if font in available:
+                return font
+    except Exception:
+        pass
+    return 'DejaVu Sans'  # fallback
+
 # 设置中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['font.sans-serif'] = [_detect_chinese_font(), 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 

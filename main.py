@@ -136,9 +136,19 @@ def run_analysis_once(alert_manager=None, email_config=None, send_notification=T
                 send_price_alert(email_config, msg, analysis['current_price'], alert_data['name'])
                 logger.warning(f"触发地缘风险提醒: {alert_data['name']}")
     
-    # 9. 发送邮件通知
+    # 9. 发送邮件通知（支持HTML格式）
     if send_notification and email_config:
-        send_analysis_report(email_config, report)
+        # 生成HTML报告
+        html_report_path = None
+        html_content = None
+        try:
+            from html_report import generate_html_report
+            html_content = generate_html_report(analysis, realtime, klines, macro_data)
+            logger.info(f"HTML报告已生成: {html_report_path}")
+        except Exception as e:
+            logger.warning(f"生成HTML报告失败: {e}，将发送纯文本报告")
+        
+        send_analysis_report(email_config, report, html_content)
     
     logger.info("分析完成")
     return report, analysis
