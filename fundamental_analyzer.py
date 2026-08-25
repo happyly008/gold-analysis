@@ -21,7 +21,19 @@ def calculate_percentile(value: float, historical_data: List[float] = None,
                          historical_range: tuple = None) -> Optional[float]:
     """计算历史分位数 (0-100)"""
     if historical_data and len(historical_data) > 0:
-        valid_data = [v for v in historical_data if v is not None and not (isinstance(v, float) and math.isnan(v))]
+        # 处理字典格式的历史数据 (如 {'date': '2024-01-01', 'DFII10': 1.2})
+        valid_data = []
+        for v in historical_data:
+            if v is None:
+                continue
+            if isinstance(v, dict):
+                # 尝试提取数值
+                val = v.get('DFII10', v.get('value', None))
+                if val is not None and not (isinstance(val, float) and math.isnan(val)):
+                    valid_data.append(val)
+            elif not (isinstance(v, float) and math.isnan(v)):
+                valid_data.append(v)
+        
         if len(valid_data) > 0:
             count_below = sum(1 for v in valid_data if v < value)
             percentile = (count_below / len(valid_data)) * 100
@@ -97,7 +109,12 @@ def analyze_real_rate_v2(real_rate: float, macro_data: Dict) -> Dict:
     if 'real_rate_history' in macro_data:
         history = macro_data['real_rate_history']
         if len(history) >= 5:
-            prev_real_rate = history[-5]  # 现在是纯数值列表
+            prev = history[-5]
+            # 防御性检查：处理字典或数值两种格式
+            if isinstance(prev, dict):
+                prev_real_rate = prev.get('DFII10', prev.get('value', None))
+            else:
+                prev_real_rate = prev
     
     if prev_real_rate is not None:
         change = real_rate - prev_real_rate

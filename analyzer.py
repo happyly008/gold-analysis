@@ -364,7 +364,7 @@ def generate_signals_v2(technical: Dict, fundamental: Dict, sentiment: Dict,
     
     # 地缘政治方向
     geo_impact = geopolitical.get('impact_score', 0) if geopolitical else 0
-    geo_direction = 'bullish' if geo_impact >= 1.5 else 'neutral'
+    geo_direction = 'bullish' if geo_impact >= 1.5 else ('bearish' if geo_impact <= -0.5 else 'neutral')
     
     # 综合方向判断
     bullish_votes = sum(1 for d in [trend_layer, swing_layer, fund_direction, sent_direction, geo_direction] 

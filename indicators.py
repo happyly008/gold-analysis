@@ -144,8 +144,30 @@ def analyze_dow_trend(candles: List[Dict]) -> Dict:
         else:
             return 'sideways'
     
+    # 长期趋势：价格 vs 120日均线 + 均线斜率（不需要双均线排列）
+    def determine_primary_trend() -> str:
+        """判断长期趋势：价格位置 + 120日均线斜率"""
+        if ma120 == 0:
+            return 'unknown'
+        
+        # 计算120日均线斜率（20日变化）
+        if len(closes) > 140:
+            ma120_20ago = calc_ma(closes[:-20], 120)
+        else:
+            ma120_20ago = ma120
+        
+        slope = ma120 - ma120_20ago
+        
+        # 判断趋势：价格在均线上方且均线上升 = 上涨趋势
+        if current > ma120 and slope > 0:
+            return 'uptrend'
+        elif current < ma120 and slope < 0:
+            return 'downtrend'
+        else:
+            return 'sideways'
+    
     # 三级趋势
-    primary_trend = determine_trend(ma120, ma120 * 0.98, 60)  # 长期：120日均线
+    primary_trend = determine_primary_trend()  # 长期：价格 vs 120日均线 + 斜率
     secondary_trend = determine_trend(ma60, ma120, 30)  # 中期：60日 vs 120日
     minor_trend = determine_trend(ma20, ma60, 10)  # 短期：20日 vs 60日
     
