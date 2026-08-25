@@ -1,0 +1,9 @@
+{
+  "weights": {
+    "technical": 0.40,
+    "fundamental": 0.35,
+    "sentiment": 0.25,
+    "geopolitical_bonus": 0.30
+  },
+  "description": "三体系权重配置（总和应为1.0）"
+}
