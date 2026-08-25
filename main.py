@@ -98,23 +98,24 @@ def run_analysis_once(alert_manager=None, email_config=None, send_notification=T
     logger.info("获取地缘政治新闻...")
     geo_monitor = GeopoliticalMonitor()
     
-    # 6. 三体系综合分析
-    logger.info("执行三体系综合分析...")
-    analysis = comprehensive_analysis(realtime, klines, macro_data, sentiment_data, geo_monitor)
-    
-    # 7. 生成报告
-    report = format_comprehensive_report(analysis, realtime, macro_data)
-    
-    # 8. 执行相关性分析
+    # 6. 执行相关性分析（在综合分析之前，用于调整权重）
     logger.info("执行历史相关性分析...")
+    correlations = {}
     try:
         correlations = run_correlation_analysis(klines)
-        correlation_report = format_correlation_report(correlations)
-        analysis['correlations'] = correlations
         logger.info("相关性分析完成")
     except Exception as e:
         logger.error(f"相关性分析失败: {e}")
-        correlation_report = None
+    
+    # 7. 三体系综合分析（传入相关性数据）
+    logger.info("执行三体系综合分析...")
+    analysis = comprehensive_analysis(realtime, klines, macro_data, sentiment_data, geo_monitor, correlations)
+    
+    # 8. 生成报告
+    report = format_comprehensive_report(analysis, realtime, macro_data)
+    
+    # 9. 格式化相关性报告
+    correlation_report = format_correlation_report(correlations) if correlations else None
     
     # 9. 检查价格提醒
     if alert_manager and analysis.get('current_price', 0) > 0:
@@ -124,6 +125,16 @@ def run_analysis_once(alert_manager=None, email_config=None, send_notification=T
                 msg = alert_manager.format_alert_message(alert_data)
                 send_price_alert(email_config, msg, analysis['current_price'], alert_data['name'])
                 logger.warning(f"触发提醒: {alert_data['name']}")
+    
+    # 10. 检查地缘风险提醒
+    if alert_manager and analysis.get('geopolitical'):
+        geo_impact = analysis['geopolitical'].get('impact_score', 0)
+        geo_triggered = alert_manager.check_geopolitical(geo_impact)
+        if geo_triggered and email_config:
+            for alert_data in geo_triggered:
+                msg = alert_manager.format_geo_alert_message(alert_data)
+                send_price_alert(email_config, msg, analysis['current_price'], alert_data['name'])
+                logger.warning(f"触发地缘风险提醒: {alert_data['name']}")
     
     # 9. 发送邮件通知
     if send_notification and email_config:

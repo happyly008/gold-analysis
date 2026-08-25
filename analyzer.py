@@ -703,9 +703,13 @@ def generate_signals_v2(technical: Dict, fundamental: Dict, sentiment: Dict,
 
 
 def comprehensive_analysis(realtime: Dict, klines: Dict, macro_data: Dict, 
-                          sentiment_data: Dict, geo_monitor: GeopoliticalMonitor = None) -> Dict:
+                          sentiment_data: Dict, geo_monitor: GeopoliticalMonitor = None,
+                          correlations: Dict = None) -> Dict:
     """
     三套体系综合分析 + 地缘政治监控 v3.0
+    
+    Args:
+        correlations: 相关性分析结果，用于动态调整技术面权重
     """
     logger.info("=" * 60)
     logger.info("开始三体系综合分析 v3.0")
@@ -755,6 +759,17 @@ def comprehensive_analysis(realtime: Dict, klines: Dict, macro_data: Dict,
     w_fund = weights.get('fundamental', 0.35)
     w_sent = weights.get('sentiment', 0.25)
     w_geo = weights.get('geopolitical_bonus', 0.30)
+    
+    # 相关性驱动的权重自适应调整
+    if correlations:
+        corr_overall = correlations.get('overall', '')
+        if '不稳定' in corr_overall or '降低技术面权重' in corr_overall:
+            w_tech *= 0.6  # 技术面权重从 0.40 降到 0.24
+            logger.warning("相关性验证: 技术指标体系不稳定，技术面权重自动降至 %.2f", w_tech)
+        elif '高度有效' in corr_overall:
+            w_tech *= 1.1  # 置信度高时微提权重
+            w_tech = min(w_tech, 0.50)  # 上限0.50
+            logger.info("相关性验证: 技术指标高度有效，技术面权重提升至 %.2f", w_tech)
     
     # v3.1: 地缘加权融合（替代简单加法，避免geo_score过大主导综合得分）
     # 地缘分[-1,1]归一化到[0,1]后参与加权，再除以总权重归一化

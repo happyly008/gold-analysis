@@ -168,14 +168,15 @@ def create_score_gauge(scores: Dict) -> str:
     """创建得分仪表盘"""
     fig, ax = plt.subplots(figsize=(8, 3))
     
-    categories = ['技术面', '基本面', '资金面']
+    categories = ['技术面', '基本面', '资金面', '地缘']
     values = [
         scores.get('technical', 0),
         scores.get('fundamental', 0),
-        scores.get('sentiment', 0)
+        scores.get('sentiment', 0),
+        scores.get('geopolitical', 0)
     ]
     
-    colors = ['#2196F3', '#4CAF50', '#FF9800']
+    colors = ['#2196F3', '#4CAF50', '#FF9800', '#F44336']
     
     bars = ax.barh(categories, values, color=colors, height=0.6)
     
@@ -408,6 +409,7 @@ def generate_html_report(analysis: Dict, realtime: Dict, klines: Dict,
     tech = analysis.get('technical', {})
     fund = analysis.get('fundamental', {})
     sent = analysis.get('sentiment', {})
+    geo = analysis.get('geopolitical', {})
     
     html += f"""
             <tr>
@@ -427,6 +429,12 @@ def generate_html_report(analysis: Dict, realtime: Dict, klines: Dict,
                 <td>{sent.get('combined_score', 0):.2f}</td>
                 <td>25%</td>
                 <td>{sent.get('overall', 'N/A')}</td>
+            </tr>
+            <tr>
+                <td>地缘政治</td>
+                <td>{geo.get('impact_score', 0):.2f}</td>
+                <td>动态</td>
+                <td>{geo.get('risk', {}).get('level', 'N/A')}</td>
             </tr>
         </table>
     </div>

@@ -9,10 +9,15 @@
 from typing import Dict, List
 import json
 import os
+from pathlib import Path
 from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
+
+# 数据文件路径
+DATA_DIR = Path(__file__).parent / 'data'
+CENTRAL_BANK_DATA_FILE = DATA_DIR / 'central_bank_gold.json'
 
 # 央行购金数据（吨）- 来自WGC季度报告
 # 数据更新频率：季度
@@ -119,9 +124,19 @@ CENTRAL_BANK_RESERVES = {
 
 
 def get_latest_central_bank_data() -> Dict:
-    """获取最新的央行购金数据"""
+    """获取最新的央行购金数据（优先从JSON文件读取）"""
     try:
-        # 返回最新季度数据
+        # 优先从JSON文件读取
+        if CENTRAL_BANK_DATA_FILE.exists():
+            with open(CENTRAL_BANK_DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if data:
+                    latest_key = max(data.keys())
+                    logger.info(f"从JSON文件加载央行购金数据: {latest_key}")
+                    return data[latest_key]
+        
+        # Fallback到静态数据
+        logger.info("使用静态央行购金数据")
         latest_key = max(CENTRAL_BANK_GOLD_DATA.keys())
         return CENTRAL_BANK_GOLD_DATA[latest_key]
     except Exception as e:
