@@ -123,6 +123,155 @@ def calculate_long_trade_metrics(entry: float, stop: float, target: float,
     }
 
 
+def calculate_friction_metrics(current_price: float, atr_dict: Dict, fees: Dict) -> Dict:
+    """
+    计算摩擦成本指标，量化手续费对不同周期的影响。
+    
+    核心逻辑：
+    - 手续费 = 固定费用 + 费率型费用 + 滑点
+    - 摩擦占比 = 手续费 / 周期波幅(ATR)
+    - 摩擦占比越高，该周期越不适合交易
+    
+    周期适用性阈值：
+    - 摩擦占比 < 5%: 适合（绿色）
+    - 5% <= 摩擦占比 < 15%: 勉强（黄色）
+    - 摩擦占比 >= 15%: 不适合（红色）
+    """
+    quantity = max(fees.get('quantity_oz', 1.0), 0.000001)
+    
+    # 计算单次往返总成本（买入 + 卖出）
+    buy_fixed = fees.get('buy_fixed_usd', 0)
+    sell_fixed = fees.get('sell_fixed_usd', 0)
+    buy_rate = fees.get('buy_rate', 0)
+    sell_rate = fees.get('sell_rate', 0)
+    slippage = fees.get('slippage_points', 0)
+    
+    # 单次往返成本 = 固定费用 + 费率费用 + 滑点
+    fixed_cost = buy_fixed + sell_fixed
+    rate_cost = current_price * quantity * (buy_rate + sell_rate)
+    slippage_cost = slippage * quantity
+    total_cost = fixed_cost + rate_cost + slippage_cost
+    
+    # 每盎司成本
+    cost_per_oz = total_cost / quantity
+    
+    # 计算各周期的摩擦占比
+    period_friction = {}
+    suitable_periods = []
+    marginal_periods = []
+    unsuitable_periods = []
+    
+    for period_name, atr_value in atr_dict.items():
+        if atr_value is None or atr_value <= 0:
+            continue
+        
+        # 摩擦占比 = 成本 / ATR（预期波幅）
+        friction_ratio = cost_per_oz / atr_value
+        friction_pct = friction_ratio * 100
+        
+        period_friction[period_name] = {
+            'atr': round(atr_value, 2),
+            'cost_per_oz': round(cost_per_oz, 2),
+            'friction_pct': round(friction_pct, 1),
+        }
+        
+        # 分类
+        if friction_pct < 5:
+            suitable_periods.append(period_name)
+            period_friction[period_name]['suitability'] = '适合'
+            period_friction[period_name]['color'] = 'green'
+        elif friction_pct < 15:
+            marginal_periods.append(period_name)
+            period_friction[period_name]['suitability'] = '勉强'
+            period_friction[period_name]['color'] = 'yellow'
+        else:
+            unsuitable_periods.append(period_name)
+            period_friction[period_name]['suitability'] = '不适合'
+            period_friction[period_name]['color'] = 'red'
+    
+    # 生成建议
+    recommendation = _generate_fee_recommendation(
+        suitable_periods, marginal_periods, unsuitable_periods, cost_per_oz
+    )
+    
+    return {
+        'total_cost_per_oz': round(cost_per_oz, 2),
+        'fixed_cost': round(fixed_cost, 2),
+        'rate_cost': round(rate_cost, 2),
+        'slippage_cost': round(slippage_cost, 2),
+        'period_friction': period_friction,
+        'suitable_periods': suitable_periods,
+        'marginal_periods': marginal_periods,
+        'unsuitable_periods': unsuitable_periods,
+        'recommendation': recommendation,
+    }
+
+
+def _generate_fee_recommendation(suitable: List, marginal: List, 
+                                  unsuitable: List, cost_per_oz: float) -> str:
+    """根据摩擦成本生成操作建议。"""
+    if not suitable and not marginal:
+        return f"当前费率过高（每盎司${cost_per_oz:.2f}），所有周期均不适合交易。建议降低费率或增大持仓量。"
+    
+    if suitable:
+        return f"当前费率适合{', '.join(suitable)}交易。{'也可考虑' + ', '.join(marginal) + '（摩擦较高）。' if marginal else ''}"
+    
+    # 只有 marginal
+    return f"当前费率偏高，仅{', '.join(marginal)}勉强可行（摩擦占比5-15%）。建议降低费率或仅在大波幅时交易。"
+
+
+def filter_signals_by_friction(signals: Dict, period_friction: Dict, 
+                                klines: Dict) -> Dict:
+    """
+    根据摩擦成本过滤信号。
+    
+    规则：
+    - 不适合周期（摩擦>=15%）的信号被过滤
+    - 勉强周期（5-15%）的信号强度降级
+    - 适合周期（<5%）的信号保持不变
+    """
+    if not period_friction:
+        return signals
+    
+    filtered_execution = []
+    filtered_count = 0
+    downgraded_count = 0
+    
+    for signal in signals.get('execution', []):
+        timeframe = signal.get('timeframe', '')
+        friction_info = period_friction.get(timeframe, {})
+        suitability = friction_info.get('suitability', '适合')
+        
+        if suitability == '不适合':
+            # 过滤掉不适合周期的信号
+            filtered_count += 1
+            continue
+        elif suitability == '勉强':
+            # 降级信号强度
+            signal_copy = signal.copy()
+            if signal_copy.get('strength') == '强':
+                signal_copy['strength'] = '中'
+            else:
+                signal_copy['strength'] = '弱'
+            signal_copy['friction_warning'] = f"摩擦占比{friction_info.get('friction_pct', 0):.1f}%"
+            filtered_execution.append(signal_copy)
+            downgraded_count += 1
+        else:
+            filtered_execution.append(signal)
+    
+    signals['execution'] = filtered_execution
+    
+    # 添加过滤统计
+    if filtered_count > 0 or downgraded_count > 0:
+        signals['friction_filter'] = {
+            'filtered': filtered_count,
+            'downgraded': downgraded_count,
+            'reason': '手续费摩擦成本过高',
+        }
+    
+    return signals
+
+
 def _calculate_atr(candles: List[Dict], period: int = 14) -> float:
     if len(candles) < 2:
         return 0.0
@@ -950,8 +1099,30 @@ def comprehensive_analysis(realtime: Dict, klines: Dict, macro_data: Dict,
     current_price = realtime.get('gold', {}).get('price', 0)
     signals = generate_signals_v2(technical, fundamental, sentiment, geopolitical, current_price, klines)
     
+    # 摩擦成本分析：量化手续费对不同周期的影响
+    fees = load_fee_config()
+    atr_dict = {}
+    for tf_data in technical.get('timeframes', []):
+        label = tf_data.get('label', '')
+        indicators = tf_data.get('indicators', {})
+        atr_val = indicators.get('atr')
+        if atr_val is not None:
+            atr_dict[label] = atr_val
+    # 也加入日线 ATR
+    daily_atr = technical.get('timeframes', [{}])[0].get('indicators', {}).get('atr')
+    if daily_atr and '日线' not in atr_dict:
+        atr_dict['日线'] = daily_atr
+    
+    friction = calculate_friction_metrics(current_price, atr_dict, fees)
+    
+    # 根据摩擦成本过滤信号
+    signals = filter_signals_by_friction(signals, friction.get('period_friction', {}), klines)
+    
     logger.info(f"主方向: {signals['direction']}")
     logger.info(f"执行信号: {len(signals['execution'])}个")
+    if signals.get('friction_filter'):
+        ff = signals['friction_filter']
+        logger.warning(f"摩擦过滤: 过滤{ff['filtered']}个，降级{ff['downgraded']}个")
     if signals['conflicts']:
         logger.warning(f"检测到信号冲突: {len(signals['conflicts'])}个")
     
@@ -963,6 +1134,7 @@ def comprehensive_analysis(realtime: Dict, klines: Dict, macro_data: Dict,
         'sentiment': sentiment,
         'geopolitical': geopolitical,
         'signals': signals,
+        'friction': friction,
         'current_price': current_price,
     }
 
@@ -1087,7 +1259,12 @@ def format_comprehensive_report(analysis: Dict, realtime: Dict, macro_data: Dict
         lines.append(f"\n  执行层信号 ({len(execution)}个):")
         for sig in execution[:10]:  # 最多显示10个
             emoji = '🟢' if sig['type'] == 'BUY' else '🔴'
-            lines.append(f"    {emoji} {sig['type']} [{sig['layer']}-{sig['timeframe']}] {sig['reason']}")
+            friction_tag = f" ⚠️{sig['friction_warning']}" if sig.get('friction_warning') else ''
+            lines.append(f"    {emoji} {sig['type']} [{sig['layer']}-{sig['timeframe']}] {sig['reason']}{friction_tag}")
+    
+    friction_filter = signals.get('friction_filter', {})
+    if friction_filter:
+        lines.append(f"\n  🔇 摩擦过滤: 已过滤{friction_filter['filtered']}个信号，降级{friction_filter['downgraded']}个（{friction_filter['reason']}）")
     
     conflicts = signals.get('conflicts', [])
     if conflicts:
@@ -1106,6 +1283,42 @@ def format_comprehensive_report(analysis: Dict, realtime: Dict, macro_data: Dict
                 f"{row['support']:>10.2f} {row['resistance']:>10.2f} "
                 f"{row['atr']:>8.2f}  {row.get('bar_time', '')}"
             )
+    
+    # 摩擦成本分析
+    friction = analysis.get('friction', {})
+    if friction:
+        lines.append(f"\n{'='*70}")
+        lines.append("【摩擦成本分析】")
+        lines.append(f"  每盎司成本: ${friction.get('total_cost_per_oz', 0):.2f}")
+        lines.append(f"  固定费用: ${friction.get('fixed_cost', 0):.2f}")
+        lines.append(f"  费率费用: ${friction.get('rate_cost', 0):.2f}")
+        lines.append(f"  滑点成本: ${friction.get('slippage_cost', 0):.2f}")
+        
+        period_friction = friction.get('period_friction', {})
+        if period_friction:
+            lines.append(f"\n  各周期摩擦占比:")
+            lines.append(f"  {'周期':<8} {'ATR':>8} {'成本':>8} {'摩擦占比':>10} {'适用性':>8}")
+            for period_name, info in period_friction.items():
+                color = info.get('color', 'green')
+                emoji = {'green': '✅', 'yellow': '⚠️', 'red': '❌'}.get(color, '⚪')
+                lines.append(
+                    f"  {period_name:<8} {info['atr']:>8.2f} {info['cost_per_oz']:>8.2f} "
+                    f"{info['friction_pct']:>9.1f}% {emoji}{info['suitability']:>6}"
+                )
+        
+        recommendation = friction.get('recommendation', '')
+        if recommendation:
+            lines.append(f"\n  💡 建议: {recommendation}")
+        
+        suitable = friction.get('suitable_periods', [])
+        marginal = friction.get('marginal_periods', [])
+        unsuitable = friction.get('unsuitable_periods', [])
+        if suitable:
+            lines.append(f"  ✅ 适合交易: {', '.join(suitable)}")
+        if marginal:
+            lines.append(f"  ⚠️ 勉强可行: {', '.join(marginal)}")
+        if unsuitable:
+            lines.append(f"  ❌ 不适合: {', '.join(unsuitable)}")
     
     # 操作建议（三要素）
     lines.append(f"\n{'='*70}")
