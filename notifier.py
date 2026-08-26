@@ -8,18 +8,36 @@
 import smtplib
 import configparser
 import logging
+import sys
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from datetime import datetime
+from pathlib import Path
+from app_paths import EMAIL_CONFIG, runtime_path
 
 logger = logging.getLogger(__name__)
 
 
-def load_email_config(config_path: str = 'config/email.ini') -> configparser.ConfigParser:
+def load_email_config(config_path=EMAIL_CONFIG) -> configparser.ConfigParser:
     """加载邮件配置"""
     config = configparser.ConfigParser()
-    config.read(config_path, encoding='utf-8')
+    config.read(runtime_path(config_path), encoding='utf-8')
     return config
+
+
+def is_email_configured(config: configparser.ConfigParser) -> bool:
+    """判断配置是否具备发送邮件所需的全部字段。"""
+    if not config or not config.has_section('smtp'):
+        return False
+    required = ('server', 'port', 'user', 'password', 'recipients')
+    if any(not config.get('smtp', key, fallback='').strip() for key in required):
+        return False
+    try:
+        port = config.getint('smtp', 'port')
+    except (ValueError, configparser.Error):
+        return False
+    return 1 <= port <= 65535
 
 
 def send_email(config: configparser.ConfigParser, subject: str, body: str, html: bool = False) -> bool:
@@ -66,6 +84,18 @@ def send_analysis_report(config: configparser.ConfigParser, report: str, html_re
     # 如果提供了HTML报告，使用multipart/alternative格式
     if html_report:
         try:
+            html_content = html_report
+            attachment_path = None
+            try:
+                candidate = Path(str(html_report)).expanduser()
+                if candidate.is_file():
+                    attachment_path = candidate.resolve()
+                    html_content = attachment_path.read_text(encoding='utf-8')
+            except (OSError, ValueError):
+                # 原始 HTML 可能很长，或包含 Windows 路径不允许的字符；
+                # 此时它本来就不是文件路径，直接作为邮件正文使用。
+                attachment_path = None
+
             smtp_server = config.get('smtp', 'server')
             smtp_port = config.getint('smtp', 'port')
             smtp_user = config.get('smtp', 'user')
@@ -73,15 +103,22 @@ def send_analysis_report(config: configparser.ConfigParser, report: str, html_re
             use_ssl = config.getboolean('smtp', 'ssl', fallback=True)
             recipients = [r.strip() for r in config.get('smtp', 'recipients').split(',')]
             
-            msg = MIMEMultipart('alternative')
+            msg = MIMEMultipart('mixed') if attachment_path else MIMEMultipart('alternative')
             msg['From'] = smtp_user
             msg['To'] = ', '.join(recipients)
             msg['Subject'] = subject
-            
-            # 添加纯文本版本（fallback）
-            msg.attach(MIMEText(report, 'plain', 'utf-8'))
-            # 添加HTML版本（优先显示）
-            msg.attach(MIMEText(html_report, 'html', 'utf-8'))
+
+            alternative = MIMEMultipart('alternative') if attachment_path else msg
+            alternative.attach(MIMEText(report, 'plain', 'utf-8'))
+            alternative.attach(MIMEText(html_content, 'html', 'utf-8'))
+            if attachment_path:
+                msg.attach(alternative)
+                with attachment_path.open('rb') as f:
+                    attachment = MIMEApplication(f.read(), _subtype='html')
+                attachment.add_header(
+                    'Content-Disposition', 'attachment', filename=attachment_path.name
+                )
+                msg.attach(attachment)
             
             if use_ssl:
                 server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=30)
@@ -93,7 +130,11 @@ def send_analysis_report(config: configparser.ConfigParser, report: str, html_re
             server.send_message(msg)
             server.quit()
             
-            logger.info(f"HTML邮件已发送: {subject}")
+            logger.info(
+                "HTML邮件已发送: %s%s",
+                subject,
+                f"，附件={attachment_path.name}" if attachment_path else "",
+            )
             return True
             
         except Exception as e:
@@ -110,22 +151,29 @@ def send_price_alert(config: configparser.ConfigParser, alert_msg: str, price: f
     return send_email(config, subject, alert_msg)
 
 
-def create_default_config(config_path: str = 'config/email.ini'):
+def create_default_config(config_path=EMAIL_CONFIG):
     """创建默认邮件配置"""
-    import os
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    config_path = runtime_path(config_path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     
     config = configparser.ConfigParser()
     config['smtp'] = {
         'server': 'smtp.qq.com',
         'port': '465',
-        'user': 'your_email@qq.com',
-        'password': 'your_auth_code',
+        'user': '',
+        'password': '',
         'ssl': 'true',
-        'recipients': 'recipient@example.com',
+        'recipients': '',
+    }
+    config['options'] = {
+        'send_report': 'false',
+        'send_alert': 'false',
+    }
+    config['timer'] = {
+        'align_to_midnight': 'true',
     }
     
-    with open(config_path, 'w', encoding='utf-8') as f:
+    with config_path.open('w', encoding='utf-8') as f:
         config.write(f)
     
     logger.info(f"已创建默认邮件配置: {config_path}")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-黄金综合分析系统 v3.0
+黄金综合分析系统 v4.2
 三套体系综合分析：
 1. 基本面/宏观面（管方向）
 2. 技术面（管节奏）
@@ -14,7 +14,7 @@ import time
 import logging
 import logging.handlers
 import argparse
-from datetime import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -24,18 +24,27 @@ from data_fetcher import (
 )
 from analyzer import comprehensive_analysis, format_comprehensive_report
 from alerts import AlertManager, create_default_alerts
-from notifier import send_analysis_report, send_price_alert, load_email_config, create_default_config
+from notifier import (
+    send_analysis_report, send_price_alert, load_email_config,
+    create_default_config, is_email_configured,
+)
 from geopolitical import GeopoliticalMonitor
 from correlation_analysis import correlation_analysis as run_correlation_analysis, format_correlation_report
+from app_paths import ALERTS_CONFIG, EMAIL_CONFIG, LOG_DIR
 
 # ========== 日志配置 ==========
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
-os.makedirs(LOG_DIR, exist_ok=True)
-
 def setup_logging(level=logging.INFO):
     """配置日志：控制台 + 文件轮转"""
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)  # 根logger最低级别
+
+    # 允许 main() 被测试代码重复调用，也避免 --debug 二次配置时重复输出。
+    for handler in list(root_logger.handlers):
+        if getattr(handler, '_gold_analysis_handler', False):
+            root_logger.removeHandler(handler)
+            handler.close()
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
     
     # 格式
     fmt = logging.Formatter(
@@ -47,31 +56,42 @@ def setup_logging(level=logging.INFO):
     ch = logging.StreamHandler()
     ch.setLevel(level)
     ch.setFormatter(fmt)
+    ch._gold_analysis_handler = True
     root_logger.addHandler(ch)
     
     # 文件 handler - 按天轮转，保留30天
-    log_file = os.path.join(LOG_DIR, 'gold_analysis.log')
+    log_file = LOG_DIR / 'gold_analysis.log'
     fh = logging.handlers.TimedRotatingFileHandler(
         log_file, when='midnight', interval=1, backupCount=30,
         encoding='utf-8'
     )
     fh.setLevel(logging.DEBUG)  # 文件记录全部级别
     fh.setFormatter(fmt)
+    fh._gold_analysis_handler = True
     root_logger.addHandler(fh)
     
     # 错误单独一份
-    err_file = os.path.join(LOG_DIR, 'error.log')
+    err_file = LOG_DIR / 'error.log'
     eh = logging.handlers.RotatingFileHandler(
         err_file, maxBytes=5*1024*1024, backupCount=5,
         encoding='utf-8'
     )
     eh.setLevel(logging.ERROR)
     eh.setFormatter(fmt)
+    eh._gold_analysis_handler = True
     root_logger.addHandler(eh)
     
     return root_logger
 
 logger = logging.getLogger('main')
+
+
+def configure_console_streams():
+    """避免 Windows GBK 控制台因报告中的 Emoji 中断整个分析任务。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, 'reconfigure', None)
+        if reconfigure:
+            reconfigure(errors='backslashreplace')
 
 
 def run_analysis_once(alert_manager=None, email_config=None, send_notification=True):
@@ -140,25 +160,25 @@ def run_analysis_once(alert_manager=None, email_config=None, send_notification=T
     if send_notification and email_config:
         # 生成HTML报告
         html_report_path = None
-        html_content = None
         try:
             from html_report import generate_html_report
-            html_content = generate_html_report(analysis, realtime, klines, macro_data)
+            html_report_path = generate_html_report(analysis, realtime, klines, macro_data)
             logger.info(f"HTML报告已生成: {html_report_path}")
         except Exception as e:
             logger.warning(f"生成HTML报告失败: {e}，将发送纯文本报告")
         
-        send_analysis_report(email_config, report, html_content)
+        send_analysis_report(email_config, report, html_report_path)
     
     logger.info("分析完成")
     return report, analysis
 
 
 def main():
+    configure_console_streams()
     # 初始化日志（先默认INFO，后面根据--debug调整）
     setup_logging(level=logging.INFO)
     
-    parser = argparse.ArgumentParser(description='黄金综合分析系统 v3.0')
+    parser = argparse.ArgumentParser(description='黄金综合分析系统 v4.2')
     parser.add_argument('--once', action='store_true', help='只执行一次')
     parser.add_argument('--interval', type=int, default=3600, help='定时间隔(秒)')
     parser.add_argument('--output', type=str, help='输出文件路径')
@@ -176,9 +196,9 @@ def main():
     # 初始化配置
     if args.init_config:
         logger.info("初始化默认配置...")
-        create_default_config('config/email.ini')
-        create_default_alerts('config/alerts.json')
-        logger.info("配置初始化完成，请编辑 config/email.ini 填入邮箱信息")
+        create_default_config(EMAIL_CONFIG)
+        create_default_alerts(ALERTS_CONFIG)
+        logger.info(f"配置初始化完成，请编辑 {EMAIL_CONFIG} 填入邮箱信息")
         return
     
     # GUI模式
@@ -188,12 +208,19 @@ def main():
         return
     
     # 加载配置
-    alert_manager = AlertManager('config/alerts.json')
+    alert_manager = AlertManager(ALERTS_CONFIG)
     email_config = None
-    try:
-        email_config = load_email_config('config/email.ini')
-    except Exception as e:
-        logger.warning(f"加载邮件配置失败: {e}，将不发送邮件")
+    if EMAIL_CONFIG.exists():
+        try:
+            loaded_email_config = load_email_config(EMAIL_CONFIG)
+            if is_email_configured(loaded_email_config):
+                email_config = loaded_email_config
+            else:
+                logger.info("邮件配置尚未填写完整，本次不发送邮件")
+        except Exception as e:
+            logger.warning(f"加载邮件配置失败: {e}，将不发送邮件")
+    else:
+        logger.info("未找到邮件配置，本次不发送邮件；可用 --init-config 创建")
     
     if args.once:
         report, analysis = run_analysis_once(
@@ -202,7 +229,9 @@ def main():
         print(report)
         
         if args.output:
-            with open(args.output, 'w', encoding='utf-8') as f:
+            output_path = Path(args.output).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open('w', encoding='utf-8') as f:
                 f.write(report)
             logger.info(f"报告已保存到: {args.output}")
         return
@@ -218,7 +247,9 @@ def main():
             print(report)
             
             if args.output:
-                with open(args.output, 'w', encoding='utf-8') as f:
+                output_path = Path(args.output).expanduser()
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with output_path.open('w', encoding='utf-8') as f:
                     f.write(report)
             
             logger.info(f"等待 {args.interval} 秒后执行下一次...")

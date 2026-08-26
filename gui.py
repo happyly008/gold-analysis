@@ -7,27 +7,35 @@ GUI界面模块 v3.1
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
+import tkinter.font as tkfont
 import threading
 import time
 import logging
+import configparser
+import json
 from datetime import datetime
 import sys
 import os
 import webbrowser
+from pathlib import Path
 import matplotlib.font_manager as fm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_fetcher import get_all_realtime, get_gold_klines, get_macro_data, get_all_sentiment_data
-from analyzer import comprehensive_analysis, format_comprehensive_report
+from analyzer import comprehensive_analysis, format_comprehensive_report, load_fee_config
 from fundamental_analyzer import format_fundamental_report
 from sentiment_analyzer import format_sentiment_report
 from geopolitical import GeopoliticalMonitor, format_geopolitical_report
 from economic_calendar import EconomicCalendar, format_calendar_report
 from correlation_analysis import correlation_analysis, format_correlation_report
 from alerts import AlertManager, PriceAlert
-from notifier import send_analysis_report, send_price_alert, load_email_config
+from notifier import (
+    send_analysis_report, send_price_alert, load_email_config,
+    create_default_config,
+)
 from html_report import generate_html_report
+from app_paths import EMAIL_CONFIG, FEES_CONFIG, LOG_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +44,7 @@ class GoldAnalysisGUI:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("\u9ec4\u91d1\u7efc\u5408\u5206\u6790\u7cfb\u7edf v3.1")
+        self.root.title("\u9ec4\u91d1\u7efc\u5408\u5206\u6790\u7cfb\u7edf v4.2")
         self.root.geometry("1200x850")
 
         self.running = False
@@ -52,6 +60,7 @@ class GoldAnalysisGUI:
 
         # 检测中文字体
         self.chinese_font = self._detect_chinese_font()
+        self.monospace_font = self._detect_monospace_font()
         logger.info(f"检测到中文字体: {self.chinese_font}")
 
         self.setup_ui()
@@ -66,6 +75,14 @@ class GoldAnalysisGUI:
             if font in available:
                 return font
         return 'DejaVu Sans'  # fallback
+
+    def _detect_monospace_font(self) -> str:
+        """选择 Windows 和常见 Linux 桌面都能回退的等宽字体。"""
+        available = set(tkfont.families(self.root))
+        for font in ('Consolas', 'Cascadia Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Monospace'):
+            if font in available:
+                return font
+        return tkfont.nametofont('TkFixedFont').actual('family')
 
     def setup_ui(self):
         # \u9876\u90e8\u63a7\u5236\u680f
@@ -99,49 +116,49 @@ class GoldAnalysisGUI:
         # Tab 1: \u5b9e\u65f6\u884c\u60c5
         tab1 = ttk.Frame(notebook)
         notebook.add(tab1, text="\u5b9e\u65f6\u884c\u60c5")
-        self.realtime_text = scrolledtext.ScrolledText(tab1, wrap=tk.WORD, font=("Consolas", 11))
+        self.realtime_text = scrolledtext.ScrolledText(tab1, wrap=tk.WORD, font=(self.monospace_font, 11))
         self.realtime_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Tab 2: \u7efc\u5408\u62a5\u544a
         tab2 = ttk.Frame(notebook)
         notebook.add(tab2, text="\u7efc\u5408\u62a5\u544a")
-        self.analysis_text = scrolledtext.ScrolledText(tab2, wrap=tk.WORD, font=("Consolas", 10))
+        self.analysis_text = scrolledtext.ScrolledText(tab2, wrap=tk.WORD, font=(self.monospace_font, 10))
         self.analysis_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Tab 3: \u4fe1\u53f7\u9762\u677f\uff08\u65b0\u589e\uff09
         tab3 = ttk.Frame(notebook)
         notebook.add(tab3, text="\u4fe1\u53f7\u9762\u677f")
-        self.signal_text = scrolledtext.ScrolledText(tab3, wrap=tk.WORD, font=("Consolas", 11))
+        self.signal_text = scrolledtext.ScrolledText(tab3, wrap=tk.WORD, font=(self.monospace_font, 11))
         self.signal_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Tab 4: \u57fa\u672c\u9762
         tab4 = ttk.Frame(notebook)
         notebook.add(tab4, text="\u57fa\u672c\u9762")
-        self.fundamental_text = scrolledtext.ScrolledText(tab4, wrap=tk.WORD, font=("Consolas", 10))
+        self.fundamental_text = scrolledtext.ScrolledText(tab4, wrap=tk.WORD, font=(self.monospace_font, 10))
         self.fundamental_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Tab 5: \u8d44\u91d1\u9762
         tab5 = ttk.Frame(notebook)
         notebook.add(tab5, text="\u8d44\u91d1\u9762")
-        self.sentiment_text = scrolledtext.ScrolledText(tab5, wrap=tk.WORD, font=("Consolas", 10))
+        self.sentiment_text = scrolledtext.ScrolledText(tab5, wrap=tk.WORD, font=(self.monospace_font, 10))
         self.sentiment_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Tab 6: \u5730\u7f18\u653f\u6cbb
         tab6 = ttk.Frame(notebook)
         notebook.add(tab6, text="\u5730\u7f18\u653f\u6cbb")
-        self.geopolitical_text = scrolledtext.ScrolledText(tab6, wrap=tk.WORD, font=("Consolas", 10))
+        self.geopolitical_text = scrolledtext.ScrolledText(tab6, wrap=tk.WORD, font=(self.monospace_font, 10))
         self.geopolitical_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Tab 7: \u76f8\u5173\u6027\u9a8c\u8bc1
         tab7 = ttk.Frame(notebook)
         notebook.add(tab7, text="\u76f8\u5173\u6027\u9a8c\u8bc1")
-        self.correlation_text = scrolledtext.ScrolledText(tab7, wrap=tk.WORD, font=("Consolas", 10))
+        self.correlation_text = scrolledtext.ScrolledText(tab7, wrap=tk.WORD, font=(self.monospace_font, 10))
         self.correlation_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Tab 8: \u7ecf\u6d4e\u65e5\u5386
         tab8 = ttk.Frame(notebook)
         notebook.add(tab8, text="\u7ecf\u6d4e\u65e5\u5386")
-        self.calendar_text = scrolledtext.ScrolledText(tab8, wrap=tk.WORD, font=("Consolas", 10))
+        self.calendar_text = scrolledtext.ScrolledText(tab8, wrap=tk.WORD, font=(self.monospace_font, 10))
         self.calendar_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Tab 9: 设置（合并所有配置）
@@ -204,7 +221,40 @@ class GoldAnalysisGUI:
         ttk.Button(btn_frame, text="保存邮件设置", command=self.save_email_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="发送测试邮件", command=self.send_test_email).pack(side=tk.LEFT, padx=5)
         
-        # 3. 定时任务设置
+        # 3. 交易成本设置
+        fee_frame = ttk.LabelFrame(scrollable_frame, text="交易成本与风控", padding="10")
+        fee_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.buy_fixed_var = tk.StringVar(value="0")
+        self.sell_fixed_var = tk.StringVar(value="13")
+        self.buy_rate_bp_var = tk.StringVar(value="0")
+        self.sell_rate_bp_var = tk.StringVar(value="0")
+        self.quantity_oz_var = tk.StringVar(value="1")
+        self.min_rr_var = tk.StringVar(value="1.5")
+        self.slippage_var = tk.StringVar(value="0")
+        self.stop_atr_var = tk.StringVar(value="1.0")
+
+        fee_fields = [
+            ("买入固定费用($):", self.buy_fixed_var, "卖出固定费用($):", self.sell_fixed_var),
+            ("买入费率(bp):", self.buy_rate_bp_var, "卖出费率(bp):", self.sell_rate_bp_var),
+            ("持仓数量(盎司):", self.quantity_oz_var, "最低净盈亏比:", self.min_rr_var),
+            ("往返滑点(点):", self.slippage_var, "止损ATR倍数:", self.stop_atr_var),
+        ]
+        for row, (left_label, left_var, right_label, right_var) in enumerate(fee_fields):
+            ttk.Label(fee_frame, text=left_label).grid(row=row, column=0, sticky=tk.W, pady=4)
+            ttk.Entry(fee_frame, textvariable=left_var, width=12).grid(row=row, column=1, padx=5)
+            ttk.Label(fee_frame, text=right_label).grid(row=row, column=2, sticky=tk.W, pady=4)
+            ttk.Entry(fee_frame, textvariable=right_var, width=12).grid(row=row, column=3, padx=5)
+        ttk.Button(fee_frame, text="保存交易成本", command=self.save_fee_config).grid(
+            row=len(fee_fields), column=0, columnspan=4, pady=8
+        )
+        ttk.Label(
+            fee_frame,
+            text="固定费用按整笔交易计；费率1bp=0.01%。净RR不足最低值时系统强制观望。",
+            foreground="gray",
+        ).grid(row=len(fee_fields) + 1, column=0, columnspan=4, sticky=tk.W)
+
+        # 4. 定时任务设置
         timer_frame = ttk.LabelFrame(scrollable_frame, text="定时任务设置", padding="10")
         timer_frame.pack(fill=tk.X, padx=10, pady=5)
         
@@ -212,7 +262,7 @@ class GoldAnalysisGUI:
         ttk.Checkbutton(timer_frame, text="对齐到0点0分0秒（从午夜开始计时周期）", variable=self.align_to_midnight_var).pack(anchor=tk.W, pady=2)
         ttk.Label(timer_frame, text="(开启后定时任务周期从每天0:00开始对齐，关闭则立即开始计时)", foreground="gray").pack(anchor=tk.W)
         
-        # 4. 价格提醒设置
+        # 5. 价格提醒设置
         alert_frame = ttk.LabelFrame(scrollable_frame, text="价格提醒设置", padding="10")
         alert_frame.pack(fill=tk.X, padx=10, pady=5)
         
@@ -253,28 +303,46 @@ class GoldAnalysisGUI:
         # \u5e95\u90e8\u65e5\u5fd7
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill=tk.X, side=tk.BOTTOM)
-        self.log_text = scrolledtext.ScrolledText(status_frame, height=4, font=("Consolas", 9))
-        self.log_text.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(status_frame, text="清理日志", command=self.clear_logs).pack(
+            side=tk.RIGHT, padx=(5, 8), pady=5
+        )
+        self.log_text = scrolledtext.ScrolledText(status_frame, height=4, font=(self.monospace_font, 9))
+        self.log_text.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=5)
 
     def load_config(self):
+        if not EMAIL_CONFIG.exists():
+            create_default_config(EMAIL_CONFIG)
+            self.log(f"已自动创建邮件配置: {EMAIL_CONFIG}")
         try:
-            self.email_config = load_email_config('config/email.ini')
+            self.email_config = load_email_config(EMAIL_CONFIG)
             if self.email_config.has_section('smtp'):
                 self.smtp_server_var.set(self.email_config.get('smtp', 'server', fallback=''))
                 self.smtp_port_var.set(self.email_config.get('smtp', 'port', fallback=''))
                 self.smtp_user_var.set(self.email_config.get('smtp', 'user', fallback=''))
+                self.smtp_pass_var.set(self.email_config.get('smtp', 'password', fallback=''))
                 self.smtp_recipients_var.set(self.email_config.get('smtp', 'recipients', fallback=''))
+                self.smtp_ssl_var.set(self.email_config.getboolean('smtp', 'ssl', fallback=True))
             # 读取邮件选项状态
             if self.email_config.has_section('options'):
                 self.send_report_var.set(self.email_config.getboolean('options', 'send_report', fallback=True))
                 self.send_alert_var.set(self.email_config.getboolean('options', 'send_alert', fallback=True))
             # 读取对齐时间配置
             if self.email_config.has_section('timer'):
-                self.align_hour_var.set(self.email_config.get('timer', 'hour', fallback='0'))
-                self.align_minute_var.set(self.email_config.get('timer', 'minute', fallback='0'))
-                self.align_second_var.set(self.email_config.get('timer', 'second', fallback='0'))
+                self.align_to_midnight_var.set(
+                    self.email_config.getboolean('timer', 'align_to_midnight', fallback=True)
+                )
         except Exception as e:
             self.log(f"加载配置失败: {e}")
+
+        fees = load_fee_config()
+        self.buy_fixed_var.set(str(fees['buy_fixed_usd']))
+        self.sell_fixed_var.set(str(fees['sell_fixed_usd']))
+        self.buy_rate_bp_var.set(str(fees['buy_rate'] * 10000))
+        self.sell_rate_bp_var.set(str(fees['sell_rate'] * 10000))
+        self.quantity_oz_var.set(str(fees['quantity_oz']))
+        self.min_rr_var.set(str(fees['min_rr_ratio']))
+        self.slippage_var.set(str(fees['slippage_points']))
+        self.stop_atr_var.set(str(fees['stop_atr_multiplier']))
 
     def log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -282,9 +350,60 @@ class GoldAnalysisGUI:
         self.log_text.see(tk.END)
         logger.info(message)
 
+    def clear_logs(self):
+        """清空当前日志并删除历史轮转文件，兼容 Windows 文件占用。"""
+        if not messagebox.askyesno("确认清理", "确定清理全部运行日志吗？"):
+            return
+
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_root = LOG_DIR.resolve()
+        active_files = set()
+        errors = []
+
+        # Windows 不能删除已打开的日志文件，因此直接截断对应 stream。
+        for handler in logging.getLogger().handlers:
+            if not isinstance(handler, logging.FileHandler):
+                continue
+            log_path = Path(handler.baseFilename).resolve()
+            try:
+                log_path.relative_to(log_root)
+            except ValueError:
+                continue
+
+            active_files.add(log_path)
+            handler.acquire()
+            try:
+                handler.flush()
+                if handler.stream:
+                    handler.stream.seek(0)
+                    handler.stream.truncate()
+            except OSError as e:
+                errors.append(f"{log_path.name}: {e}")
+            finally:
+                handler.release()
+
+        # 删除未被 Handler 占用的轮转日志；范围严格限制在 logs 目录第一层。
+        for log_path in LOG_DIR.iterdir():
+            is_log_file = log_path.name.endswith('.log') or '.log.' in log_path.name
+            if not log_path.is_file() or not is_log_file or log_path.resolve() in active_files:
+                continue
+            try:
+                log_path.unlink()
+            except OSError as e:
+                errors.append(f"{log_path.name}: {e}")
+
+        self.log_text.delete('1.0', tk.END)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert(tk.END, f"[{timestamp}] 日志已清理\n")
+
+        if errors:
+            messagebox.showwarning("部分清理失败", "\n".join(errors))
+        else:
+            messagebox.showinfo("清理完成", "运行日志和历史日志已清理")
+
     def open_html_report(self):
         if self.latest_html_path and os.path.exists(self.latest_html_path):
-            webbrowser.open(f'file://{self.latest_html_path}')
+            webbrowser.open(Path(self.latest_html_path).resolve().as_uri())
         else:
             messagebox.showwarning("\u63d0\u793a", "\u8bf7\u5148\u70b9\u51fb\u201c\u7acb\u5373\u5206\u6790\u201d\u751f\u6210\u62a5\u544a")
 
@@ -296,6 +415,10 @@ class GoldAnalysisGUI:
         self.btn_analyze.config(state=tk.DISABLED)
         self.status_label.config(text="\u5206\u6790\u4e2d...", foreground="orange")
         self.log("\u5f00\u59cb\u5206\u6790...")
+
+        # Tk 变量只能在主线程访问；在线程启动前取得不可变快照。
+        send_report = self.send_report_var.get()
+        send_alert = self.send_alert_var.get()
 
         def analysis_thread():
             try:
@@ -332,11 +455,11 @@ class GoldAnalysisGUI:
                 self.root.after(0, self.update_calendar_display, cal_report)
 
                 # 发送分析报告邮件（可选）
-                self.root.after(0, self.log, f"邮件配置: {self.email_config is not None}, 发送报告: {self.send_report_var.get()}")
-                if self.email_config and self.send_report_var.get():
+                self.root.after(0, self.log, f"邮件配置: {self.email_config is not None}, 发送报告: {send_report}")
+                if self.email_config and send_report:
                     try:
                         self.root.after(0, self.log, "正在发送分析报告邮件...")
-                        result = send_analysis_report(self.email_config, report)
+                        result = send_analysis_report(self.email_config, report, html_path)
                         if result:
                             self.root.after(0, self.log, "分析报告已发送至邮箱")
                         else:
@@ -347,7 +470,7 @@ class GoldAnalysisGUI:
 
                 current_price = realtime.get('gold', {}).get('price', 0)
                 triggered = self.alert_manager.check_price(current_price)
-                if triggered and self.email_config and self.send_alert_var.get():
+                if triggered and self.email_config and send_alert:
                     for ad in triggered:
                         msg = self.alert_manager.format_alert_message(ad)
                         send_price_alert(self.email_config, msg, current_price, ad['name'])
@@ -468,11 +591,23 @@ class GoldAnalysisGUI:
             for c in conflicts:
                 lines.append(f"  \u26a0\ufe0f {c['description']}")
 
+        period_table = signals.get('period_table', [])
+        if period_table:
+            lines.append("\n【已收盘K线周期点位】")
+            lines.append(f"  {'周期':<7} {'方向':<8} {'支撑':>9} {'阻力':>9} {'ATR':>7}  最后收盘")
+            for row in period_table:
+                lines.append(
+                    f"  {row['label']:<7} {row['direction']:<8} "
+                    f"{row['support']:>9.2f} {row['resistance']:>9.2f} "
+                    f"{row['atr']:>7.2f}  {row.get('bar_time', '')}"
+                )
+
         # \u64cd\u4f5c\u5efa\u8bae
         rec = signals.get('recommendation', {})
         if rec:
             lines.append(f"\n{'=' * 60}")
             lines.append("\u3010\u64cd\u4f5c\u5efa\u8bae\u3011")
+            lines.append(f"  状态: {rec.get('status_code', 'N/A')}")
             lines.append(f"  \u64cd\u4f5c: {rec.get('action', 'N/A')}")
             lines.append(f"  \u7b56\u7565: {rec.get('strategy', 'N/A')}")
             lines.append(f"  \u5165\u573a: {rec.get('entry', 'N/A')}")
@@ -480,6 +615,10 @@ class GoldAnalysisGUI:
             lines.append(f"  \u6b62\u635f: {rec.get('stop_loss', 'N/A')}")
             lines.append(f"  \u76ee\u6807: {rec.get('target', 'N/A')}")
             lines.append(f"  \u6761\u4ef6: {rec.get('condition', 'N/A')}")
+            lines.append(f"  下次确认: {rec.get('next_watch', 'N/A')}")
+            lines.append(f"  成本: {rec.get('cost_note', 'N/A')}")
+            if rec.get('net_rr') is not None:
+                lines.append(f"  净盈亏比: {rec['net_rr']:.2f}")
 
         lines.append(f"\n{'=' * 60}")
         lines.append("\u26a0\ufe0f \u4ee5\u4e0a\u4ec5\u4f9b\u53c2\u8003\uff0c\u4e0d\u6784\u6210\u6295\u8d44\u5efa\u8bae\u3002")
@@ -607,16 +746,78 @@ class GoldAnalysisGUI:
                 alert.name, cm.get(alert.condition, alert.condition),
                 alert.threshold, '\u2713' if alert.enabled else '\u2717'))
 
-    def save_email_config(self):
-        import configparser
+    def save_fee_config(self):
+        """保存买入、卖出成本及净盈亏比风控参数。"""
+        try:
+            values = {
+                'buy_fixed_usd': float(self.buy_fixed_var.get()),
+                'sell_fixed_usd': float(self.sell_fixed_var.get()),
+                'buy_rate': float(self.buy_rate_bp_var.get()) / 10000.0,
+                'sell_rate': float(self.sell_rate_bp_var.get()) / 10000.0,
+                'quantity_oz': float(self.quantity_oz_var.get()),
+                'min_rr_ratio': float(self.min_rr_var.get()),
+                'slippage_points': float(self.slippage_var.get()),
+                'stop_atr_multiplier': float(self.stop_atr_var.get()),
+            }
+        except ValueError:
+            messagebox.showwarning("参数错误", "交易成本设置必须全部填写数字")
+            return
+
+        if any(values[key] < 0 for key in (
+            'buy_fixed_usd', 'sell_fixed_usd', 'buy_rate', 'sell_rate', 'slippage_points'
+        )):
+            messagebox.showwarning("参数错误", "费用、费率和滑点不能小于0")
+            return
+        if values['quantity_oz'] <= 0 or values['stop_atr_multiplier'] <= 0:
+            messagebox.showwarning("参数错误", "持仓数量和止损ATR倍数必须大于0")
+            return
+        if values['min_rr_ratio'] < 1.0:
+            messagebox.showwarning("参数错误", "最低净盈亏比不能小于1.0")
+            return
+
+        fees = load_fee_config()
+        fees.update(values)
+        FEES_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        with FEES_CONFIG.open('w', encoding='utf-8') as f:
+            json.dump({'fees': fees}, f, ensure_ascii=False, indent=2)
+        self.log("交易成本设置已保存")
+        messagebox.showinfo("成功", "交易成本设置已保存，下次分析立即生效")
+
+    def _build_email_config_from_form(self):
+        """根据界面当前内容构建配置；测试邮件不要求先写入磁盘。"""
+        values = {
+            'server': self.smtp_server_var.get().strip(),
+            'port': self.smtp_port_var.get().strip(),
+            'user': self.smtp_user_var.get().strip(),
+            'password': self.smtp_pass_var.get().strip(),
+            'recipients': self.smtp_recipients_var.get().strip(),
+        }
+        labels = {
+            'server': 'SMTP服务器',
+            'port': '端口',
+            'user': '发件人',
+            'password': '授权码',
+            'recipients': '收件人',
+        }
+        missing = [labels[key] for key, value in values.items() if not value]
+        if missing:
+            raise ValueError(f"请填写：{'、'.join(missing)}")
+
+        try:
+            port = int(values['port'])
+        except ValueError as exc:
+            raise ValueError("SMTP端口必须是整数") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError("SMTP端口必须在 1-65535 之间")
+
         config = configparser.ConfigParser()
         config['smtp'] = {
-            'server': self.smtp_server_var.get(),
-            'port': self.smtp_port_var.get(),
-            'user': self.smtp_user_var.get(),
-            'password': self.smtp_pass_var.get(),
+            'server': values['server'],
+            'port': str(port),
+            'user': values['user'],
+            'password': values['password'],
             'ssl': str(self.smtp_ssl_var.get()).lower(),
-            'recipients': self.smtp_recipients_var.get(),
+            'recipients': values['recipients'],
         }
         # 保存邮件选项状态
         config['options'] = {
@@ -625,23 +826,33 @@ class GoldAnalysisGUI:
         }
         # 保存对齐时间配置
         config['timer'] = {
-            'hour': self.align_hour_var.get(),
-            'minute': self.align_minute_var.get(),
-            'second': self.align_second_var.get(),
+            'align_to_midnight': str(self.align_to_midnight_var.get()).lower(),
         }
-        os.makedirs('config', exist_ok=True)
-        with open('config/email.ini', 'w', encoding='utf-8') as f:
+        return config
+
+    def save_email_config(self):
+        try:
+            config = self._build_email_config_from_form()
+        except ValueError as e:
+            messagebox.showwarning("配置不完整", str(e))
+            return
+
+        EMAIL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        with EMAIL_CONFIG.open('w', encoding='utf-8') as f:
             config.write(f)
         self.email_config = config
         self.log("配置已保存")
         messagebox.showinfo("成功", "配置已保存")
 
     def send_test_email(self):
-        if not self.email_config:
-            messagebox.showwarning("\u63d0\u793a", "\u8bf7\u5148\u4fdd\u5b58\u914d\u7f6e")
+        try:
+            test_config = self._build_email_config_from_form()
+        except ValueError as e:
+            messagebox.showwarning("配置不完整", str(e))
             return
+
         def test():
-            ok = send_analysis_report(self.email_config, "\u6d4b\u8bd5\u90ae\u4ef6\n\n\u9ec4\u91d1\u5206\u6790\u7cfb\u7edf")
+            ok = send_analysis_report(test_config, "\u6d4b\u8bd5\u90ae\u4ef6\n\n\u9ec4\u91d1\u5206\u6790\u7cfb\u7edf")
             if ok:
                 self.root.after(0, messagebox.showinfo, "\u6210\u529f", "\u6d4b\u8bd5\u90ae\u4ef6\u5df2\u53d1\u9001")
             else:

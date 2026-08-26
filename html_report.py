@@ -5,7 +5,6 @@ HTML图表化报告生成器
 生成包含图表的HTML格式分析报告
 """
 
-import os
 import base64
 from io import BytesIO
 from datetime import datetime
@@ -16,6 +15,9 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.patches import Rectangle
 import logging
+from pathlib import Path
+from html import escape as html_escape
+from app_paths import REPORT_DIR, runtime_path
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +169,10 @@ def create_indicator_chart(candles: List[Dict], indicators: Dict) -> str:
         ax3.axhline(y=50, color='gray', linestyle='-', linewidth=0.5)
         ax3.fill_between([0, 1], 70, 100, alpha=0.1, color='red')
         ax3.fill_between([0, 1], 0, 30, alpha=0.1, color='green')
-        ax3.text(0.5, rsi, f'RSI={rsi:.1f}', transform=ax3.get_xaxis_transform(),
+        # x 使用坐标轴比例（0.5=水平居中），y 使用 RSI 数据值。
+        # get_xaxis_transform 会把 y 当成坐标轴比例，RSI=50 时会把图片
+        # 的紧边界撑到约 50 倍高度，导致 HTML 中间出现巨大的空白区。
+        ax3.text(0.5, rsi, f'RSI={rsi:.1f}', transform=ax3.get_yaxis_transform(),
                 ha='center', fontsize=10, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     ax3.set_ylim(0, 100)
     ax3.set_title('RSI指标(14)')
@@ -243,7 +248,7 @@ def generate_html_report(analysis: Dict, realtime: Dict, klines: Dict,
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>黄金三体系分析报告 - {datetime.now().strftime('%Y-%m-%d %H:%M')}</title>
+    <title>黄金三体系分析报告 v4.2 - {datetime.now().strftime('%Y-%m-%d %H:%M')}</title>
     <style>
         body {{
             font-family: 'Microsoft YaHei', Arial, sans-serif;
@@ -493,6 +498,7 @@ def generate_html_report(analysis: Dict, realtime: Dict, klines: Dict,
         direction_map = {'bullish': '🟢 看多', 'bearish': '🔴 看空', 'neutral': '⚪ 中性'}
         execution = signals.get('execution', [])
         conflicts = signals.get('conflicts', [])
+        period_table = signals.get('period_table', [])
         rec = signals.get('recommendation', {})
         
         html += f"""
@@ -500,6 +506,24 @@ def generate_html_report(analysis: Dict, realtime: Dict, klines: Dict,
         <h2>💡 交易信号</h2>
         <p><strong>主方向:</strong> {direction_map.get(direction, direction)}</p>
 """
+        if period_table:
+            html += """
+        <h3>已收盘K线周期点位</h3>
+        <table>
+            <tr><th>周期</th><th>方向</th><th>支撑</th><th>阻力</th><th>ATR</th><th>最后收盘</th></tr>
+"""
+            for row in period_table:
+                html += f"""
+            <tr>
+                <td>{html_escape(str(row.get('label', '')))}</td>
+                <td>{html_escape(str(row.get('direction', '')))}</td>
+                <td>{row.get('support', 0):.2f}</td>
+                <td>{row.get('resistance', 0):.2f}</td>
+                <td>{row.get('atr', 0):.2f}</td>
+                <td>{html_escape(str(row.get('bar_time', '')))}</td>
+            </tr>
+"""
+            html += "</table>"
         if execution:
             html += """<h3>执行层信号</h3><div class="signals">"""
             for sig in execution:
@@ -528,6 +552,7 @@ def generate_html_report(analysis: Dict, realtime: Dict, klines: Dict,
             html += f"""
         <h3>📋 操作建议</h3>
         <table>
+            <tr><td><strong>状态</strong></td><td>{html_escape(str(rec.get('status_code', 'N/A')))}</td></tr>
             <tr><td><strong>操作</strong></td><td>{rec.get('action', 'N/A')}</td></tr>
             <tr><td><strong>策略</strong></td><td>{rec.get('strategy', 'N/A')}</td></tr>
             <tr><td><strong>入场</strong></td><td>{rec.get('entry', 'N/A')}</td></tr>
@@ -535,6 +560,8 @@ def generate_html_report(analysis: Dict, realtime: Dict, klines: Dict,
             <tr><td><strong>止损</strong></td><td>{rec.get('stop_loss', 'N/A')}</td></tr>
             <tr><td><strong>目标</strong></td><td>{rec.get('target', 'N/A')}</td></tr>
             <tr><td><strong>条件</strong></td><td>{rec.get('condition', 'N/A')}</td></tr>
+            <tr><td><strong>下次确认</strong></td><td>{html_escape(str(rec.get('next_watch', 'N/A')))}</td></tr>
+            <tr><td><strong>成本/净RR</strong></td><td>{html_escape(str(rec.get('cost_note', 'N/A')))}</td></tr>
         </table>
 """
         html += """
@@ -544,7 +571,7 @@ def generate_html_report(analysis: Dict, realtime: Dict, klines: Dict,
     # 页脚
     html += f"""
     <div class="footer">
-        <p>本报告由黄金分析系统v3.0自动生成，仅供参考，不构成投资建议。</p>
+        <p>本报告由黄金分析系统v4.2自动生成，仅供参考，不构成投资建议。</p>
         <p>生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
     </div>
 </body>
@@ -553,16 +580,17 @@ def generate_html_report(analysis: Dict, realtime: Dict, klines: Dict,
     
     # 保存文件
     if output_path is None:
-        output_dir = os.path.join(os.path.dirname(__file__), 'reports')
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, 
-                                   f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        output_path = REPORT_DIR / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+    else:
+        output_path = runtime_path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    with open(output_path, 'w', encoding='utf-8') as f:
+    with Path(output_path).open('w', encoding='utf-8') as f:
         f.write(html)
     
     logger.info(f"HTML报告已生成: {output_path}")
-    return output_path
+    return str(Path(output_path).resolve())
 
 
 if __name__ == '__main__':

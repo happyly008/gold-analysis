@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-综合分析引擎 v3.1
+综合分析引擎 v4.2
 改进:
 - 地缘评分从"简单加法"改为"加权融合"(归一化后参与总权重),
   避免 geo_score 过大时主导综合得分
@@ -13,37 +13,198 @@
 3. 输出升级（触发价/仓位/止损三要素）
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 from indicators import calc_all_indicators, calc_ma, analyze_volume_price
 from fundamental_analyzer import fundamental_analysis, format_fundamental_report
 from sentiment_analyzer import sentiment_analysis, format_sentiment_report
 from geopolitical import GeopoliticalMonitor, format_geopolitical_report
 import logging
 import json
-import os
 import math
+from datetime import datetime, timedelta, timezone
+from app_paths import CONFIG_DIR, bundled_path
 
 logger = logging.getLogger(__name__)
+BEIJING_TZ = timezone(timedelta(hours=8), name='Asia/Shanghai')
 
 # 默认权重
 DEFAULT_WEIGHTS = {
     'technical': 0.40,
     'fundamental': 0.35,
     'sentiment': 0.25,
-    'geopolitical_bonus': 0.30
+    'geopolitical_bonus': 0.15
 }
 
 def load_weights() -> Dict:
     """加载权重配置"""
-    config_path = os.path.join(os.path.dirname(__file__), 'config', 'weights.json')
+    config_path = CONFIG_DIR / 'weights.json'
+    if not config_path.exists():
+        config_path = bundled_path('config/weights.json')
     try:
-        if os.path.exists(config_path):
+        if config_path.exists():
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
                 return config.get('weights', DEFAULT_WEIGHTS)
     except Exception as e:
         logger.warning(f"加载权重配置失败，使用默认值: {e}")
     return DEFAULT_WEIGHTS
+
+
+DEFAULT_FEE_CONFIG = {
+    'long_only': True,
+    'quantity_oz': 1.0,
+    'buy_fixed_usd': 0.0,
+    'sell_fixed_usd': 13.0,
+    'buy_rate': 0.0,
+    'sell_rate': 0.0,
+    'slippage_points': 0.0,
+    'min_rr_ratio': 1.5,
+    'preferred_rr_ratio': 2.0,
+    'stop_atr_multiplier': 1.0,
+    'risk_pct': 0.01,
+}
+
+
+def load_fee_config() -> Dict:
+    """加载做多成本与风控配置，兼容固定费用和按成交额费率。"""
+    config = DEFAULT_FEE_CONFIG.copy()
+    config_path = CONFIG_DIR / 'fees.json'
+    if not config_path.exists():
+        config_path = bundled_path('config/fees.json')
+    try:
+        if config_path.exists():
+            with config_path.open('r', encoding='utf-8') as f:
+                user = json.load(f).get('fees', {})
+            config.update({k: user[k] for k in config if k in user})
+    except (OSError, ValueError, TypeError) as e:
+        logger.warning("加载费用配置失败，使用默认值: %s", e)
+
+    numeric_keys = [k for k in config if k != 'long_only']
+    for key in numeric_keys:
+        try:
+            config[key] = float(config[key])
+        except (TypeError, ValueError):
+            config[key] = DEFAULT_FEE_CONFIG[key]
+    config['quantity_oz'] = max(config['quantity_oz'], 0.000001)
+    config['min_rr_ratio'] = max(config['min_rr_ratio'], 0.1)
+    config['preferred_rr_ratio'] = max(config['preferred_rr_ratio'], config['min_rr_ratio'])
+    config['stop_atr_multiplier'] = max(config['stop_atr_multiplier'], 0.1)
+    return config
+
+
+def calculate_long_trade_metrics(entry: float, stop: float, target: float,
+                                 fees: Dict) -> Dict:
+    """按持仓数量计算做多净收益、净风险、净盈亏比和最低目标价。"""
+    quantity = fees['quantity_oz']
+    buy_cost = fees['buy_fixed_usd'] + entry * quantity * fees['buy_rate']
+    target_sell_cost = fees['sell_fixed_usd'] + target * quantity * fees['sell_rate']
+    stop_sell_cost = fees['sell_fixed_usd'] + stop * quantity * fees['sell_rate']
+    slippage_cost = fees['slippage_points'] * quantity
+
+    reward_net = (target - entry) * quantity - buy_cost - target_sell_cost - slippage_cost
+    risk_net = (entry - stop) * quantity + buy_cost + stop_sell_cost + slippage_cost
+    net_rr = reward_net / risk_net if risk_net > 0 else 0.0
+
+    # 解 Reward_net >= min_rr * Risk_net，费率型退出成本也纳入目标。
+    denominator = quantity * (1.0 - fees['sell_rate'])
+    min_target = 0.0
+    if denominator > 0:
+        min_target = (
+            entry * quantity + buy_cost + fees['sell_fixed_usd'] + slippage_cost
+            + fees['min_rr_ratio'] * risk_net
+        ) / denominator
+
+    return {
+        'reward_net_usd': round(reward_net, 2),
+        'risk_net_usd': round(risk_net, 2),
+        'net_rr': round(net_rr, 2),
+        'min_target': round(min_target, 2),
+        'cost_per_oz': round((buy_cost + target_sell_cost + slippage_cost) / quantity, 2),
+    }
+
+
+def _calculate_atr(candles: List[Dict], period: int = 14) -> float:
+    if len(candles) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        high, low = candles[i]['high'], candles[i]['low']
+        previous_close = candles[i - 1]['close']
+        trs.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+    if len(trs) < period:
+        return sum(trs) / len(trs)
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+def calculate_period_levels(candles: List[Dict], indicators: Dict,
+                            swing: int = 3, lookback: int = 160) -> Dict:
+    """计算单周期最近有效结构位；支撑必须低于当前价，阻力必须高于当前价。"""
+    if len(candles) < swing * 2 + 1:
+        return {'support': None, 'resistance': None, 'atr': 0.0, 'method': 'insufficient'}
+
+    recent = candles[-lookback:]
+    current = recent[-1]['close']
+    atr = _calculate_atr(recent, 14)
+    supports = []
+    resistances = []
+
+    for index in range(swing, len(recent) - swing):
+        window = recent[index - swing:index + swing + 1]
+        age = len(recent) - 1 - index
+        if recent[index]['low'] == min(c['low'] for c in window) and recent[index]['low'] < current:
+            supports.append((recent[index]['low'], age))
+        if recent[index]['high'] == max(c['high'] for c in window) and recent[index]['high'] > current:
+            resistances.append((recent[index]['high'], age))
+
+    scale = max(atr, current * 0.001, 0.01)
+
+    def choose(candidates):
+        if not candidates:
+            return None
+        # 距离优先，同时轻度惩罚过旧结构，避免多年高低点主导执行层。
+        return min(candidates, key=lambda item: abs(item[0] - current) / scale + item[1] * 0.01)[0]
+
+    support = choose(supports)
+    resistance = choose(resistances)
+    method = 'swing'
+
+    sr = indicators.get('support_resistance', {})
+    if support is None:
+        valid = [value for value in sr.get('supports', []) if value < current]
+        support = max(valid) if valid else None
+    if resistance is None:
+        valid = [value for value in sr.get('resistances', []) if value > current]
+        resistance = min(valid) if valid else None
+
+    if support is None or resistance is None:
+        last = recent[-1]
+        pivot = (last['high'] + last['low'] + last['close']) / 3
+        s1 = 2 * pivot - last['high']
+        r1 = 2 * pivot - last['low']
+        support = support or (s1 if s1 < current else None)
+        resistance = resistance or (r1 if r1 > current else None)
+        method = 'swing+pivot'
+
+    return {
+        'support': round(support, 2) if support is not None else None,
+        'resistance': round(resistance, 2) if resistance is not None else None,
+        'atr': round(atr, 2),
+        'method': method,
+    }
+
+
+def _next_15m_watch_time() -> str:
+    now = datetime.now(BEIJING_TZ)
+    next_minute = ((now.minute // 15) + 1) * 15
+    next_close = now.replace(second=0, microsecond=0)
+    if next_minute >= 60:
+        next_close = next_close.replace(minute=0) + timedelta(hours=1)
+    else:
+        next_close = next_close.replace(minute=next_minute)
+    return next_close.strftime('%Y-%m-%d %H:%M 北京时间（15分钟收盘）')
 
 
 def analyze_single_timeframe(candles: List[Dict], label: str) -> Dict:
@@ -284,6 +445,11 @@ def analyze_multi_timeframe_v2(klines: Dict) -> Dict:
             analysis = analyze_single_timeframe(klines[key], label)
             if 'error' in analysis:
                 continue
+
+            levels = calculate_period_levels(
+                klines[key], analysis.get('indicators', {}),
+                swing=2 if key in ('5min', '15min') else 3,
+            )
             
             # 周期权重：同层内按时间长度
             tf_weight = {'5min': 0.3, '15min': 0.7, '1hour': 0.4, '4hour': 0.6, 'daily': 1.0}.get(key, 0.5)
@@ -296,7 +462,12 @@ def analyze_multi_timeframe_v2(klines: Dict) -> Dict:
                 'reasons': analysis['reasons'],
                 'indicators': analysis['indicators'],
                 'layer': layer_info['name'],
-                'raw_data': analysis.get('raw_data', [])  # 传递原始K线
+                'raw_data': analysis.get('raw_data', []),  # 仅包含已收盘K线
+                'support': levels['support'],
+                'resistance': levels['resistance'],
+                'atr': levels['atr'],
+                'level_method': levels['method'],
+                'bar_time': klines[key][-1].get('time', '') if klines[key] else '',
             })
             
             layer_score += analysis['score'] * tf_weight
@@ -401,7 +572,8 @@ def generate_signals_v2(technical: Dict, fundamental: Dict, sentiment: Dict,
         'direction': None,  # 主方向
         'execution': [],    # 执行信号
         'conflicts': [],    # 冲突信号
-        'recommendation': {}  # 操作建议
+        'recommendation': {},  # 操作建议
+        'period_table': [],    # 各周期独立结构位
     }
     
     # ========== 方向层 ==========
@@ -419,7 +591,8 @@ def generate_signals_v2(technical: Dict, fundamental: Dict, sentiment: Dict,
     
     # 地缘政治方向
     geo_impact = geopolitical.get('impact_score', 0) if geopolitical else 0
-    geo_direction = 'bullish' if geo_impact >= 1.5 else ('bearish' if geo_impact <= -0.5 else 'neutral')
+    # geopolitical impact_score 的实际范围是 [-1, 1]。
+    geo_direction = 'bullish' if geo_impact >= 0.15 else ('bearish' if geo_impact <= -0.15 else 'neutral')
     
     # 综合方向判断
     bullish_votes = sum(1 for d in [trend_layer, swing_layer, fund_direction, sent_direction, geo_direction] 
@@ -556,203 +729,126 @@ def generate_signals_v2(technical: Dict, fundamental: Dict, sentiment: Dict,
                 'weighted_score': buy_weighted - sell_weighted
             })
     
-    # ========== 操作建议 ==========
-    direction = signals['direction']
-    intraday_direction = intraday_layer
-    agreement = technical.get('agreement', 50)
-    
-    # 检查是否有冲突
+    # ========== 多周期结构表与做多计划 ==========
+    timeframes = technical.get('timeframes', [])
+    by_label = {tf.get('label'): tf for tf in timeframes}
+    for tf in timeframes:
+        support = tf.get('support')
+        resistance = tf.get('resistance')
+        atr = tf.get('atr', 0)
+        if support is None or resistance is None or atr <= 0:
+            continue
+        signals['period_table'].append({
+            'label': tf.get('label', ''),
+            'direction': 'bullish' if tf.get('score', 0) >= 1 else (
+                'bearish' if tf.get('score', 0) <= -1 else 'neutral'
+            ),
+            'support': support,
+            'resistance': resistance,
+            'atr': atr,
+            'bar_time': tf.get('bar_time', ''),
+            'method': tf.get('level_method', ''),
+        })
+
+    # 15分钟负责执行，1小时/4小时提供上方结构目标；全部数据均已收盘。
+    active = next((by_label[label] for label in ('15分钟', '1小时', '5分钟', '4小时', '日线')
+                   if label in by_label and by_label[label].get('support') is not None), None)
+    support_candidates = [tf.get('support') for tf in timeframes
+                          if tf.get('support') is not None and tf.get('support') < current_price]
+    entry_price = max(support_candidates) if support_candidates else None
+    target_candidates = [tf.get('resistance') for tf in timeframes
+                         if tf.get('resistance') is not None and tf.get('resistance') > current_price]
+    target_price = min(target_candidates) if target_candidates else None
+    atr_value = active.get('atr', 0) if active else 0
+
+    fees = load_fee_config()
+    stop_price = None
+    metrics = None
+    if entry_price is not None and target_price is not None and atr_value > 0:
+        stop_price = entry_price - atr_value * fees['stop_atr_multiplier']
+        metrics = calculate_long_trade_metrics(entry_price, stop_price, target_price, fees)
+
+    confirm_tf = by_label.get('15分钟')
+    confirmation_items = []
+    confirmed = False
+    if confirm_tf:
+        indicators = confirm_tf.get('indicators', {})
+        macd = indicators.get('macd', {})
+        close_price = indicators.get('current', 0)
+        confirmation_items = [
+            ('15分钟方向转多', confirm_tf.get('score', 0) >= 1.0),
+            ('收盘站上MA5', close_price > indicators.get('ma5', 0)),
+            ('MACD位于信号线上方', macd.get('dif', 0) >= macd.get('dea', 0)),
+            ('RSI(6)不低于50', indicators.get('rsi6', 0) >= 50),
+        ]
+        confirmed = all(value for _, value in confirmation_items)
+
+    confirmation_text = '；'.join(
+        f"{'✓' if value else '✗'}{name}" for name, value in confirmation_items
+    ) or '等待有效15分钟收盘数据'
+    next_watch = _next_15m_watch_time()
     conflict_info = signals['conflicts'][0] if signals['conflicts'] else None
-    
-    # 获取支撑阻力位（多源融合：枢轴点 + 布林带 + 斐波那契）
-    support_price = None
-    resistance_price = None
-    current_price = current_price  # 函数参数已传入
-    
-    # 方法1: 经典枢轴点 (Pivot Point) - 基于昨日OHLC，每日更新
-    for tf in technical.get('timeframes', []):
-        if tf.get('label') == '日线':
-            kline_data = tf.get('raw_data', [])
-            if len(kline_data) >= 2:
-                prev = kline_data[-2]  # 昨日K线
-                pivot = (prev['high'] + prev['low'] + prev['close']) / 3
-                s1 = 2 * pivot - prev['high']
-                r1 = 2 * pivot - prev['low']
-                s2 = pivot - (prev['high'] - prev['low'])
-                r2 = pivot + (prev['high'] - prev['low'])
-                # 取距当前价最近的支撑/阻力
-                supports_pivot = sorted([s for s in [s1, s2] if s < current_price], reverse=True)
-                resistances_pivot = sorted([r for r in [r1, r2] if r > current_price])
-                if supports_pivot:
-                    support_price = supports_pivot[0]
-                if resistances_pivot:
-                    resistance_price = resistances_pivot[0]
-            break
-    
-    # 方法2: 布林带上下轨（仅当枢轴点不存在时使用）
-    for tf in technical.get('timeframes', []):
-        if tf.get('label') == '日线':
-            bb = tf.get('indicators', {}).get('bollinger', {})
-            bb_lower = bb.get('lower', 0)
-            bb_upper = bb.get('upper', 0)
-            if not support_price and bb_lower and bb_lower < current_price:
-                support_price = bb_lower
-            if not resistance_price and bb_upper and bb_upper > current_price:
-                resistance_price = bb_upper
-            break
-    
-    # 方法3: 如果以上都没有，回退到斐波那契
-    if not support_price or not resistance_price:
-        for tf in technical.get('timeframes', []):
-            if tf.get('label') == '日线':
-                sr = tf.get('indicators', {}).get('support_resistance', {})
-                supports = sr.get('supports', [])
-                resistances = sr.get('resistances', [])
-                if not support_price and supports:
-                    support_price = supports[0]
-                if not resistance_price and resistances:
-                    resistance_price = resistances[0]
-                break
-    
-    # ATR动态止损计算
-    # 从日线数据计算ATR
-    atr_value = 0
-    for tf in technical.get('timeframes', []):
-        if tf.get('label') == '日线':
-            kline_data = tf.get('raw_data', [])
-            if len(kline_data) >= 15:
-                # 计算14日ATR
-                trs = []
-                for i in range(1, len(kline_data)):
-                    h = kline_data[i]['high']
-                    l = kline_data[i]['low']
-                    pc = kline_data[i-1]['close']
-                    tr = max(h - l, abs(h - pc), abs(l - pc))
-                    trs.append(tr)
-                if len(trs) >= 14:
-                    atr_value = sum(trs[:14]) / 14
-                    for i in range(14, len(trs)):
-                        atr_value = (atr_value * 13 + trs[i]) / 14
-            break
-    
-    # 根据ATR计算动态止损
-    # 规则：止损距离 = 2倍ATR（适应不同波动环境）
-    # 高波动时止损更宽，低波动时止损更窄
-    if atr_value > 0:
-        atr_stop_distance = atr_value * 2
-        stop_loss_price = (support_price - atr_stop_distance) if support_price else None
-        stop_loss_price_short = (resistance_price + atr_stop_distance) if resistance_price else None
-    else:
-        # ATR计算失败时回退到固定3%
-        stop_loss_price = support_price * 0.97 if support_price else None
-        stop_loss_price_short = resistance_price * 1.03 if resistance_price else None
-    
-    # 生成建议（考虑冲突）
+    direction = signals['direction']
+
+    status_code = 'NO_TRADE_DATA'
+    action = '观望'
+    strategy = '缺少有效结构位或ATR，不能生成交易计划'
     if conflict_info and conflict_info.get('resolution') == 'wait':
-        # 轻度冲突，建议等待
-        signals['recommendation'] = {
-            'action': '观望等待',
-            'strategy': f"信号冲突（{conflict_info['description']}），建议等待方向明确",
-            'entry': '等待冲突解决后再入场',
-            'position': '暂不入场',
-            'stop_loss': 'N/A',
-            'target': 'N/A',
-            'condition': '等待趋势层或波段层信号明确'
-        }
-    elif conflict_info and conflict_info.get('resolution') == 'follow_dominant':
-        # 重度冲突，按主导方向
-        dominant = conflict_info.get('dominant_direction')
-        if dominant == 'bullish':
-            signals['recommendation'] = {
-                'action': '谨慎做多',
-                'strategy': f"虽有冲突，但趋势层偏多，可轻仓试多",
-                'entry': f'回调至{support_price:.0f}附近' if support_price else '回调至支撑位',
-                'position': '总风险1% AUM，轻仓',
-                'stop_loss': f'跌破{stop_loss_price:.0f}止损（支撑位下方{atr_stop_distance:.0f}，约2倍ATR）' if stop_loss_price and atr_value > 0 else ('跌破关键支撑止损' if stop_loss_price else 'N/A'),
-                'target': f'目标{resistance_price:.0f}' if resistance_price else '上看阻力位',
-                'condition': '严格止损，快进快出'
-            }
-        else:
-            stop_loss_price_short = resistance_price * 1.03 if resistance_price else None
-            signals['recommendation'] = {
-                'action': '谨慎做空',
-                'strategy': f"虽有冲突，但趋势层偏空，可轻仓试空",
-                'entry': f'反弹至{resistance_price:.0f}附近' if resistance_price else '反弹至阻力位',
-                'position': '总风险1% AUM，轻仓',
-                'stop_loss': f'突破{stop_loss_price_short:.0f}止损（阻力位上方{atr_stop_distance:.0f}，约2倍ATR）' if stop_loss_price_short and atr_value > 0 else ('突破关键阻力止损' if stop_loss_price_short else 'N/A'),
-                'target': f'下看{support_price:.0f}' if support_price else '下看支撑位',
-                'condition': '严格止损，快进快出'
-            }
-    elif direction == 'bullish':
-        if intraday_direction == 'bearish' or (sell_signals and not buy_signals):
-            # 主多但短周期空
-            signals['recommendation'] = {
-                'action': '等待回调',
-                'strategy': '主方向看多，但短周期偏空，不追多',
-                'entry': f'等待回踩支撑位{support_price:.0f}' if support_price else '等待回调至支撑位',
-                'position': '总风险1-2% AUM，首仓1/3',
-                'stop_loss': f'跌破{stop_loss_price:.0f}止损（支撑位下方{atr_stop_distance:.0f}，约2倍ATR）' if stop_loss_price and atr_value > 0 else ('跌破关键支撑止损' if stop_loss_price else 'N/A'),
-                'target': f'上看阻力位{resistance_price:.0f}' if resistance_price else '上看阻力位',
-                'condition': '短周期转多确认后入场'
-            }
-        else:
-            # 主多且短周期也多
-            signals['recommendation'] = {
-                'action': '逢低做多',
-                'strategy': '多周期共振看多，可积极入场',
-                'entry': f'回调至{support_price:.0f}附近' if support_price else '回调至支撑位',
-                'position': '总风险2-3% AUM，可分2-3批建仓',
-                'stop_loss': f'跌破{stop_loss_price:.0f}止损（支撑位下方{atr_stop_distance:.0f}，约2倍ATR）' if stop_loss_price and atr_value > 0 else ('跌破关键支撑止损' if stop_loss_price else 'N/A'),
-                'target': f'目标{resistance_price:.0f}' if resistance_price else '上看阻力位',
-                'condition': '直接入场或小幅回调后入场'
-            }
-    elif direction == 'bearish':
-        # 止盈计算：阻力位上方2-3%
-        stop_loss_price_short = resistance_price * 1.03 if resistance_price else None
-        if intraday_direction == 'bullish' or (buy_signals and not sell_signals):
-            # 主空但短周期多
-            signals['recommendation'] = {
-                'action': '观望或轻仓试空',
-                'strategy': '主方向看空，但短周期偏多，谨慎操作',
-                'entry': f'反弹至{resistance_price:.0f}附近' if resistance_price else '反弹至阻力位',
-                'position': '总风险1% AUM，轻仓试空',
-                'stop_loss': f'突破{stop_loss_price_short:.0f}止损（阻力位上方{atr_stop_distance:.0f}，约2倍ATR）' if stop_loss_price_short and atr_value > 0 else ('突破关键阻力止损' if stop_loss_price_short else 'N/A'),
-                'target': f'下看{support_price:.0f}' if support_price else '下看支撑位',
-                'condition': '短周期转空确认后入场'
-            }
-        else:
-            # 主空且短周期也空
-            signals['recommendation'] = {
-                'action': '逢高做空',
-                'strategy': '多周期共振看空，可积极入场',
-                'entry': f'反弹至{resistance_price:.0f}附近' if resistance_price else '反弹至阻力位',
-                'position': '总风险2-3% AUM，可分2-3批建仓',
-                'stop_loss': f'突破{stop_loss_price_short:.0f}止损（阻力位上方{atr_stop_distance:.0f}，约2倍ATR）' if stop_loss_price_short and atr_value > 0 else ('突破关键阻力止损' if stop_loss_price_short else 'N/A'),
-                'target': f'目标{support_price:.0f}' if support_price else '下看支撑位',
-                'condition': '直接入场或小幅反弹后入场'
-            }
+        status_code = 'WAIT_CONFLICT'
+        strategy = f"信号冲突：{conflict_info['description']}"
+    elif direction != 'bullish':
+        status_code = 'WAIT_DIRECTION'
+        strategy = f"当前主方向为{direction}；系统仅考虑做多，暂不交易"
+    elif metrics is None:
+        status_code = 'NO_TRADE_DATA'
+    elif metrics['net_rr'] < fees['min_rr_ratio']:
+        status_code = 'NO_TRADE_RR'
+        action = '观望（盈亏比不足）'
+        strategy = (
+            f"计划净盈亏比{metrics['net_rr']:.2f}低于最低要求"
+            f"{fees['min_rr_ratio']:.2f}，不允许入场"
+        )
+    elif entry_price is not None and current_price > entry_price + atr_value * 0.5:
+        status_code = 'WAIT_PULLBACK'
+        action = '等待回踩'
+        strategy = '主方向看多，但价格尚未进入15分钟支撑执行区，不追多'
+    elif not confirmed:
+        status_code = 'WAIT_CONFIRMATION'
+        action = '等待确认'
+        strategy = '价格已接近执行区，等待已收盘15分钟K线完成转多确认'
     else:
-        # 中性
-        if agreement < 60:
-            signals['recommendation'] = {
-                'action': '观望',
-                'strategy': '方向不明确，周期一致性低，建议观望',
-                'entry': '等待方向明确',
-                'position': '不建议入场',
-                'stop_loss': 'N/A',
-                'target': 'N/A',
-                'condition': '等待至少2个周期方向一致'
-            }
-        else:
-            signals['recommendation'] = {
-                'action': '区间操作',
-                'strategy': '方向中性，可区间高抛低吸',
-                'entry': f'支撑位{support_price:.0f}附近做多，阻力位{resistance_price:.0f}附近做空' if support_price and resistance_price else '支撑位做多，阻力位做空',
-                'position': '总风险1% AUM，轻仓',
-                'stop_loss': '跌破支撑或突破阻力止损',
-                'target': '区间内操作',
-                'condition': '严格止损，快进快出'
-            }
+        status_code = 'READY_LONG'
+        action = '计划做多'
+        strategy = '主方向、执行区和15分钟确认同时满足，按计划风险执行'
+
+    can_enter = status_code == 'READY_LONG'
+    fee_note = (
+        f"买入固定${fees['buy_fixed_usd']:.2f}+{fees['buy_rate'] * 10000:.2f}bp，"
+        f"卖出固定${fees['sell_fixed_usd']:.2f}+{fees['sell_rate'] * 10000:.2f}bp，"
+        f"按{fees['quantity_oz']:.4g}盎司计算"
+    )
+    if metrics:
+        fee_note += (
+            f"；净盈亏比{metrics['net_rr']:.2f}，最低合格目标{metrics['min_target']:.2f}"
+        )
+
+    signals['recommendation'] = {
+        'status_code': status_code,
+        'action': action,
+        'strategy': strategy,
+        'entry': f'{entry_price:.2f}附近' if entry_price is not None else 'N/A',
+        'position': f"单笔净风险不超过账户{fees['risk_pct'] * 100:.1f}%" if can_enter else '不入场',
+        'stop_loss': f'{stop_price:.2f}' if stop_price is not None else 'N/A',
+        'target': f'{target_price:.2f}' if target_price is not None else 'N/A',
+        'condition': confirmation_text,
+        'next_watch': next_watch,
+        'cost_note': fee_note,
+        'net_rr': metrics['net_rr'] if metrics else None,
+        'reward_net_usd': metrics['reward_net_usd'] if metrics else None,
+        'risk_net_usd': metrics['risk_net_usd'] if metrics else None,
+        'min_target': metrics['min_target'] if metrics else None,
+        'active_period': active.get('label', '') if active else '',
+    }
     
     return signals
 
@@ -767,7 +863,7 @@ def comprehensive_analysis(realtime: Dict, klines: Dict, macro_data: Dict,
         correlations: 相关性分析结果，用于动态调整技术面权重
     """
     logger.info("=" * 60)
-    logger.info("开始三体系综合分析 v3.0")
+    logger.info("开始三体系综合分析 v4.2")
     logger.info("=" * 60)
     
     # 1. 技术面分析
@@ -813,7 +909,7 @@ def comprehensive_analysis(realtime: Dict, klines: Dict, macro_data: Dict,
     w_tech = weights.get('technical', 0.40)
     w_fund = weights.get('fundamental', 0.35)
     w_sent = weights.get('sentiment', 0.25)
-    w_geo = weights.get('geopolitical_bonus', 0.30)
+    w_geo = weights.get('geopolitical_bonus', 0.15)
     
     # 相关性驱动的权重自适应调整
     if correlations:
@@ -826,12 +922,11 @@ def comprehensive_analysis(realtime: Dict, klines: Dict, macro_data: Dict,
             w_tech = min(w_tech, 0.50)  # 上限0.50
             logger.info("相关性验证: 技术指标高度有效，技术面权重提升至 %.2f", w_tech)
     
-    # v3.1: 地缘加权融合（替代简单加法，避免geo_score过大主导综合得分）
-    # 地缘分[-1,1]归一化到[0,1]后参与加权，再除以总权重归一化
-    geo_norm = max(0.0, min(1.0, (geo_score + 1.0) / 2.0))
-    total_w = w_tech + w_fund + w_sent + w_geo
+    # 地缘分范围[-1,1]，作为有符号的小幅修正；0必须保持中性而不是产生正偏置。
+    geo_score = max(-1.0, min(1.0, geo_score))
+    base_w = w_tech + w_fund + w_sent
     base_score = tech_score * w_tech + fund_score * w_fund + sent_score * w_sent
-    total_score = (base_score + geo_norm * w_geo) / total_w
+    total_score = (base_score / base_w if base_w > 0 else 0.0) + geo_score * w_geo
     
     # 综合判断
     if total_score >= 2.0:
@@ -876,7 +971,7 @@ def format_comprehensive_report(analysis: Dict, realtime: Dict, macro_data: Dict
     """生成完整三体系分析报告 v3.0"""
     lines = []
     lines.append("=" * 70)
-    lines.append("黄金三体系综合分析报告 v3.0")
+    lines.append("黄金三体系综合分析报告 v4.2")
     lines.append("=" * 70)
     
     # 实时行情
@@ -999,6 +1094,18 @@ def format_comprehensive_report(analysis: Dict, realtime: Dict, macro_data: Dict
         lines.append(f"\n  ⚠️ 信号冲突 ({len(conflicts)}个):")
         for conflict in conflicts[:3]:
             lines.append(f"    - {conflict['description']}")
+
+    period_table = signals.get('period_table', [])
+    if period_table:
+        lines.append(f"\n{'='*70}")
+        lines.append("【已收盘K线周期点位】")
+        lines.append(f"  {'周期':<7} {'方向':<8} {'支撑':>10} {'阻力':>10} {'ATR':>8}  最后收盘")
+        for row in period_table:
+            lines.append(
+                f"  {row['label']:<7} {row['direction']:<8} "
+                f"{row['support']:>10.2f} {row['resistance']:>10.2f} "
+                f"{row['atr']:>8.2f}  {row.get('bar_time', '')}"
+            )
     
     # 操作建议（三要素）
     lines.append(f"\n{'='*70}")
@@ -1006,6 +1113,7 @@ def format_comprehensive_report(analysis: Dict, realtime: Dict, macro_data: Dict
     
     rec = signals.get('recommendation', {})
     if rec:
+        lines.append(f"  状态: {rec.get('status_code', 'N/A')}")
         lines.append(f"  操作: {rec.get('action', 'N/A')}")
         lines.append(f"  策略: {rec.get('strategy', 'N/A')}")
         lines.append(f"  入场: {rec.get('entry', 'N/A')}")
@@ -1013,6 +1121,13 @@ def format_comprehensive_report(analysis: Dict, realtime: Dict, macro_data: Dict
         lines.append(f"  止损: {rec.get('stop_loss', 'N/A')}")
         lines.append(f"  目标: {rec.get('target', 'N/A')}")
         lines.append(f"  条件: {rec.get('condition', 'N/A')}")
+        lines.append(f"  下次确认: {rec.get('next_watch', 'N/A')}")
+        lines.append(f"  成本: {rec.get('cost_note', 'N/A')}")
+        if rec.get('net_rr') is not None:
+            lines.append(
+                f"  净收益/风险: ${rec.get('reward_net_usd', 0):.2f} / "
+                f"${rec.get('risk_net_usd', 0):.2f}，RR={rec['net_rr']:.2f}"
+            )
     else:
         lines.append("  暂无明确建议")
     

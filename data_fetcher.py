@@ -13,13 +13,15 @@
 import requests
 import re
 import csv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 import logging
 import asyncio
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+BEIJING_TZ = timezone(timedelta(hours=8), name='Asia/Shanghai')
 
 HEADERS = {
     'Referer': 'https://finance.sina.com.cn/',
@@ -203,6 +205,41 @@ def sina_daily_kline(symbol: str) -> List[Dict]:
             continue
     
     return candles
+
+
+def filter_closed_candles(candles: List[Dict], timeframe: str,
+                          now: Optional[datetime] = None) -> List[Dict]:
+    """过滤新浪以周期结束时间标记的未收盘K线，避免指标盘中重绘。"""
+    if not candles:
+        return []
+
+    now_bj = now or datetime.now(BEIJING_TZ)
+    if now_bj.tzinfo is None:
+        now_bj = now_bj.replace(tzinfo=BEIJING_TZ)
+    now_local = now_bj.astimezone(BEIJING_TZ).replace(tzinfo=None)
+    cutoff = now_local - timedelta(seconds=5)
+    closed = []
+
+    for candle in candles:
+        raw_time = str(candle.get('time', '')).strip()
+        try:
+            bar_time = datetime.fromisoformat(raw_time.replace('Z', '+00:00'))
+            if bar_time.tzinfo is not None:
+                bar_time = bar_time.astimezone(BEIJING_TZ).replace(tzinfo=None)
+
+            if timeframe == 'daily':
+                # 当天日线在盘中持续变化，只使用此前交易日的确认数据。
+                is_closed = bar_time.date() < now_local.date()
+            else:
+                is_closed = bar_time <= cutoff
+        except (TypeError, ValueError):
+            logger.warning("无法识别%s K线时间，已排除: %s", timeframe, raw_time)
+            is_closed = False
+
+        if is_closed:
+            closed.append(candle)
+
+    return closed
 
 
 # ============================================================
@@ -633,12 +670,12 @@ def get_gold_klines() -> Dict:
     for label, ktype in [('5min', 5), ('15min', 15), ('1hour', 60), ('4hour', 240)]:
         try:
             candles = sina_kline('XAU', ktype)
-            result[label] = candles
+            result[label] = filter_closed_candles(candles, label)
         except Exception as e:
             logger.warning(f"获取黄金{label}K线失败: {e}")
     
     try:
-        result['daily'] = sina_daily_kline('XAU')
+        result['daily'] = filter_closed_candles(sina_daily_kline('XAU'), 'daily')
     except Exception as e:
         logger.warning(f"获取黄金日线失败: {e}")
     

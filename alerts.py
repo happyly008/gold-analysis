@@ -10,6 +10,7 @@ import os
 import logging
 from datetime import datetime
 from typing import Dict, List, Callable, Optional
+from app_paths import ALERTS_CONFIG, runtime_path
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +131,8 @@ class GeopoliticalAlert:
 class AlertManager:
     """提醒管理器"""
     
-    def __init__(self, config_path: str = 'config/alerts.json'):
-        self.config_path = config_path
+    def __init__(self, config_path=ALERTS_CONFIG):
+        self.config_path = runtime_path(config_path)
         self.alerts: List[PriceAlert] = []
         self.geo_alerts: List[GeopoliticalAlert] = []
         self.prev_price = None
@@ -165,7 +166,7 @@ class AlertManager:
     def save_alerts(self):
         """保存提醒规则"""
         try:
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 'price_alerts': [a.to_dict() for a in self.alerts],
                 'geo_alerts': [a.to_dict() for a in self.geo_alerts]
@@ -277,7 +278,7 @@ DEFAULT_ALERTS = [
 ]
 
 
-def create_default_alerts(config_path: str = 'config/alerts.json'):
+def create_default_alerts(config_path=ALERTS_CONFIG):
     """创建默认提醒规则"""
     manager = AlertManager(config_path)
     manager.alerts = DEFAULT_ALERTS
